@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unreal-harness"
+version = "1.0.0"
+description = "Local-first AI agent harness with deep, full-control access to Unreal Engine 5"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.27",
+    "pydantic>=2.5",
+]
+
+[project.scripts]
+unreal-harness = "harness.__main__:main"
+uh = "harness.__main__:main"
+
+[tool.setuptools]
+packages = ["harness", "harness.ue", "harness.tools"]
+
+[tool.setuptools.package-data]
+harness = ["static/*", "ue/*.py", "data/*"]
