@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+releases/
+.config/
+.pytest_cache/
+plugin/UEHarness/Binaries/
+plugin/UEHarness/Intermediate/
+*.uproject.bak
+.DS_Store
