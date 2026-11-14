@@ -153,7 +153,7 @@ def ue_find_function(ctx, name: str, limit: int = 15):
 @tool("ue_search_assets", "Search the Content Browser for assets by name and/or class.",
       "unreal",
       parameters=P(query=S("Name substring"), **{"class": S("Class name, e.g. Blueprint, StaticMesh")},
-                   path=S("Content root", "/Game"), limit=N("Max", 60)))
+                   path=S("Content root", default="/Game"), limit=N("Max", 60)))
 def ue_search_assets(ctx, query: str = "", limit: int = 60, path: str = "/Game", **kw):
     ok, res, err = _ue(ctx).call("asset.search", {
         "query": query, "class": kw.get("class", ""), "path": path, "limit": limit})
@@ -295,8 +295,9 @@ def bp_set_pin_default(ctx, bp: str, pin: str, value: str, graph: str = "EventGr
       "defaults=[{pin:'print.InString',value:'Hello'}]",
       "blueprints", risk="write",
       parameters=req(P(bp=S("Blueprint path"), graph=S("Graph name"),
-                       nodes=A("Node specs (objects)"), links=A("Link specs (objects)"),
-                       defaults=A("Pin default specs (objects)"),
+                       nodes=A("Node specs (objects)", "object"),
+                       links=A("Link specs (objects)", "object"),
+                       defaults=A("Pin default specs (objects)", "object"),
                        compile=B("Compile after building", True)), "bp", "nodes"))
 def bp_build(ctx, bp: str, nodes: list, links: list | None = None,
              defaults: list | None = None, graph: str = "EventGraph", compile: bool = True):
@@ -373,7 +374,8 @@ def ue_python(ctx, code: str):
 
 @tool("ue_run_batch", "Run several native commands in ONE round trip (pipelined). "
       "Calls = [{'cmd':'bp.add_node','args':{...}}, ...]. Use for bulk edits.",
-      "unreal", risk="write", parameters=req(P(calls=A("List of {cmd,args} objects")), "calls"))
+      "unreal", risk="write",
+      parameters=req(P(calls=A("List of {cmd,args} objects", "object")), "calls"))
 def ue_run_batch(ctx, calls: list):
     pairs = [(c.get("cmd", ""), c.get("args", {}) or {}) for c in calls]
     results = _ue(ctx).batch(pairs)

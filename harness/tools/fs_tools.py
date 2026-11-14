@@ -110,7 +110,7 @@ def fs_patch(ctx, path: str, old: str, new: str, count: int = 1):
 
 
 @tool("fs_list", "List a directory with sizes and types.", "files",
-      parameters=req(P(path=S("Directory (default: project root)", "."),
+      parameters=req(P(path=S("Directory (default: project root)", default="."),
                        depth=N("Recursion depth", 1),
                        glob=S("Optional glob filter, e.g. *.uasset")), ))
 def fs_list(ctx, path: str = ".", depth: int = 1, glob: str = ""):
@@ -149,7 +149,7 @@ def fs_glob(ctx, pattern: str, limit: int = 200):
 
 @tool("fs_grep", "Search file contents with a regex (ripgrep-style). Returns file:line: text.",
       "files", parameters=req(P(pattern=S("Regex pattern"),
-                                path=S("Directory or file", "."),
+                                path=S("Directory or file", default="."),
                                 include=S("Glob filter, e.g. *.cpp"),
                                 limit=N("Max matches", 120),
                                 ignore_case=B("Case insensitive", True)), "pattern"))

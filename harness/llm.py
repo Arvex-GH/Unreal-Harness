@@ -1,11 +1,13 @@
 """LLM client: OpenAI-compatible, defaults tuned for LM Studio.
 
 LM Studio exposes /v1/chat/completions and supports OpenAI-style `tools`.
-Not every local model does tool calling well, so we detect failure and fall back
-to a strict text protocol that we parse ourselves.
+Not every local model does tool calling well, so we detect failure (both HTTP
+errors and mid-stream SSE engine errors) and fall back to a strict text protocol
+that we parse ourselves.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from typing import Any, AsyncIterator
@@ -19,10 +21,74 @@ class LLMError(RuntimeError):
     pass
 
 
+def _is_embedding_model(model_id: str) -> bool:
+    low = (model_id or "").lower()
+    return "embed" in low or low.startswith("text-embedding")
+
+
+def _extract_error_message(payload: Any) -> str:
+    """Pull a readable error message out of OpenAI / LM Studio / llama.cpp payloads."""
+    if isinstance(payload, str):
+        stripped = payload.strip()
+        if stripped.startswith("{"):
+            try:
+                return _extract_error_message(json.loads(stripped))
+            except json.JSONDecodeError:
+                pass
+        return stripped
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("error")
+            if msg:
+                return _extract_error_message(msg)
+            return json.dumps(err)
+        if isinstance(err, str) and err.strip():
+            return _extract_error_message(err)
+        if isinstance(payload.get("message"), str) and payload["message"].strip():
+            return _extract_error_message(payload["message"])
+        return json.dumps(payload)
+    return str(payload)
+
+
+def _is_tools_error(status_code: int, message: str) -> bool:
+    """Return True if an LLM error is likely caused by passing native `tools`."""
+    low = (message or "").lower()
+    if any(fatal in low for fatal in ("no models loaded", "model not found", "not loaded")):
+        return False
+    if status_code in (400, 422):
+        return True
+    return any(
+        kw in low
+        for kw in (
+            "tool",
+            "function",
+            "json schema",
+            "schema error",
+            "grammar",
+            "jinja",
+            "template",
+            "context size",
+            "context length",
+            "n_ctx",
+            "exceeded",
+        )
+    )
+
+
 class LLMClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+        self._client: httpx.AsyncClient | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._no_tools_models: set[str] = set()
+
+    def _get_client(self) -> httpx.AsyncClient:
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._client.is_closed or self._loop is not loop:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+            self._loop = loop
+        return self._client
 
     # ------------------------------------------------------------------ util
     def _headers(self) -> dict[str, str]:
@@ -31,10 +97,23 @@ class LLMClient:
             h["Authorization"] = f"Bearer {self.cfg.llm_api_key}"
         return h
 
+    def supports_native_tools(self, model: str = "") -> bool:
+        if not self.cfg.native_tool_calls:
+            return False
+        if model and model in self._no_tools_models:
+            return False
+        return True
+
+    def mark_tools_unsupported(self, model: str = "") -> None:
+        if model:
+            self._no_tools_models.add(model)
+        else:
+            self.cfg.native_tool_calls = False
+
     async def list_models(self) -> list[dict[str, Any]]:
         try:
-            r = await self._client.get(f"{self.cfg.llm_base_url}/models",
-                                       headers=self._headers(), timeout=8.0)
+            r = await self._get_client().get(f"{self.cfg.llm_base_url}/models",
+                                             headers=self._headers(), timeout=8.0)
             r.raise_for_status()
             data = r.json()
             return data.get("data", []) if isinstance(data, dict) else []
@@ -46,9 +125,12 @@ class LLMClient:
     async def health(self) -> dict[str, Any]:
         try:
             models = await self.list_models()
-            ids = [m.get("id") for m in models]
-            return {"ok": True, "models": ids, "base_url": self.cfg.llm_base_url,
-                    "selected": self.cfg.model or (ids[0] if ids else None)}
+            ids = [m.get("id") for m in models if m.get("id")]
+            chat_ids = [mid for mid in ids if not _is_embedding_model(mid)]
+            default_id = chat_ids[0] if chat_ids else (ids[0] if ids else None)
+            return {"ok": True, "models": ids, "chat_models": chat_ids,
+                    "base_url": self.cfg.llm_base_url,
+                    "selected": self.cfg.model or default_id}
         except LLMError as e:
             return {"ok": False, "error": str(e), "base_url": self.cfg.llm_base_url}
 
@@ -58,12 +140,11 @@ class LLMClient:
         models = await self.list_models()
         if not models:
             raise LLMError("LM Studio reports no loaded models. Load a model first.")
-        self.cfg.model = models[0]["id"]
-        try:
-            self.cfg.save()
-        except Exception:
-            pass
-        return self.cfg.model
+        ids = [m["id"] for m in models if m.get("id")]
+        chat_ids = [mid for mid in ids if not _is_embedding_model(mid)]
+        if not chat_ids and not ids:
+            raise LLMError("LM Studio reports no usable models. Load a chat/LLM model first.")
+        return chat_ids[0] if chat_ids else ids[0]
 
     # ------------------------------------------------------------------ chat
     async def stream_chat(self, messages: list[dict], tools: list[dict] | None = None,
@@ -72,6 +153,7 @@ class LLMClient:
         """Yields events: {'type':'text','text':..}, {'type':'tool_calls','calls':..},
         {'type':'usage','usage':..}, {'type':'done'}."""
         model = await self.resolve_model()
+        use_tools = bool(tools and self.supports_native_tools(model))
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -79,40 +161,67 @@ class LLMClient:
             "max_tokens": self.cfg.max_tokens if max_tokens is None else max_tokens,
             "stream": True,
         }
-        if tools and self.cfg.native_tool_calls:
+        if use_tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
         url = f"{self.cfg.llm_base_url}/chat/completions"
         acc: list[dict] = []
         text_buf: list[str] = []
+        reasoning_buf: list[str] = []
         usage: dict[str, Any] | None = None
+        stream_error: str | None = None
+        raw_non_sse: list[str] = []
+        event_type = ""
 
         try:
-            async with self._client.stream("POST", url, json=body, headers=self._headers()) as r:
+            async with self._get_client().stream("POST", url, json=body, headers=self._headers()) as r:
                 if r.status_code >= 400:
                     raw = (await r.aread()).decode("utf-8", "replace")
-                    if body.get("tools") and ("tool" in raw.lower() or "400" in str(r.status_code)):
-                        # Model/server refuses tools, or emitted a tool-related 400:
-                        # retry once without them so we fall back to text protocol.
-                        self.cfg.native_tool_calls = False
-                        raise LLMError(f"TOOLS_UNSUPPORTED::{raw[:400]}")
-                    raise LLMError(f"LLM {r.status_code}: {raw[:800]}")
+                    msg = _extract_error_message(raw)
+                    if use_tools and _is_tools_error(r.status_code, raw):
+                        self.mark_tools_unsupported(model)
+                        raise LLMError(f"TOOLS_UNSUPPORTED::{msg[:400]}")
+                    raise LLMError(f"LLM {r.status_code}: {msg[:800]}")
 
                 async for line in r.aiter_lines():
-                    if not line or not line.startswith("data:"):
+                    stripped = line.strip()
+                    if not stripped:
+                        event_type = ""
                         continue
-                    data = line[5:].strip()
+                    if stripped.startswith(":"):
+                        continue
+                    if stripped.startswith("event:"):
+                        event_type = stripped[6:].strip().lower()
+                        continue
+                    if not stripped.startswith("data:"):
+                        raw_non_sse.append(stripped)
+                        continue
+
+                    data = stripped[5:].strip()
                     if data == "[DONE]":
                         break
                     try:
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
+                        if event_type == "error" and data:
+                            stream_error = data
+                            break
+                        continue
+
+                    if isinstance(chunk, dict) and (chunk.get("error") or event_type == "error"):
+                        stream_error = _extract_error_message(chunk)
+                        break
+
+                    if not isinstance(chunk, dict):
                         continue
                     if chunk.get("usage"):
                         usage = chunk["usage"]
                     for choice in chunk.get("choices", []):
-                        delta = choice.get("delta") or {}
+                        delta = choice.get("delta") or choice.get("message") or {}
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                        if reasoning:
+                            reasoning_buf.append(reasoning)
                         if delta.get("content"):
                             text_buf.append(delta["content"])
                             yield {"type": "text", "text": delta["content"]}
@@ -131,6 +240,21 @@ class LLMClient:
         except httpx.HTTPError as e:
             raise LLMError(f"LLM connection error: {e}") from e
 
+        if not stream_error and raw_non_sse and not text_buf and not acc:
+            joined = "\n".join(raw_non_sse)
+            try:
+                parsed = json.loads(joined)
+                if isinstance(parsed, dict) and (parsed.get("error") or parsed.get("message")):
+                    stream_error = _extract_error_message(parsed)
+            except json.JSONDecodeError:
+                pass
+
+        if stream_error:
+            if use_tools and _is_tools_error(500, stream_error):
+                self.mark_tools_unsupported(model)
+                raise LLMError(f"TOOLS_UNSUPPORTED::{stream_error[:400]}")
+            raise LLMError(f"LM Studio error: {stream_error[:800]}")
+
         clean_calls = [c for c in acc if c["function"]["name"]]
         for i, c in enumerate(clean_calls):
             if not c["id"]:
@@ -139,7 +263,8 @@ class LLMClient:
             yield {"type": "tool_calls", "calls": clean_calls}
         if usage:
             yield {"type": "usage", "usage": usage}
-        yield {"type": "done", "text": "".join(text_buf)}
+        yield {"type": "done", "text": "".join(text_buf),
+               "reasoning": "".join(reasoning_buf)}
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +292,7 @@ def parse_text_tool_calls(text: str) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
         items = data if isinstance(data, list) else [data]
-        for i, item in enumerate(items):
+        for item in items:
             if not isinstance(item, dict):
                 continue
             name = item.get("tool") or item.get("name") or item.get("function")

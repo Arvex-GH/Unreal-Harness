@@ -6,12 +6,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "releases"
 VERSION = (ROOT / "VERSION").read_text().strip()
-SKIP = {".git", ".venv", "__pycache__", "dist", "releases", "build", "*.egg-info", ".pytest_cache"}
+SKIP = {".git", ".venv", ".config", "__pycache__", "dist", "releases", "build", ".pytest_cache"}
 
 
 def files():
-    for p in ROOT.rglob("*"):
-        if any(part in SKIP for part in p.parts):
+    for p in sorted(ROOT.rglob("*")):
+        rel_parts = p.relative_to(ROOT).parts
+        if any(part in SKIP or part.endswith(".egg-info") for part in rel_parts):
             continue
         if p.is_file() and p.name not in (".DS_Store",):
             yield p

@@ -388,7 +388,7 @@
         <h4>Updates</h4>
         <div class="field">
           <label>Repository</label>
-          <input type="text" id="s_repo_url" placeholder="https://github.com/you/unreal-harness">
+          <input type="text" id="s_repo_url" placeholder="https://github.com/Arvex-GH/Unreal-Harness">
         </div>
         <div class="field">
           <label>Channel</label>
@@ -858,9 +858,12 @@ async function loadSettings() {
   // models
   try {
     const { models } = await api('/api/llm/models');
+    const chatModels = (models || []).filter(
+      m => m?.id && (!m.id.toLowerCase().includes('embed') || m.id === settings.model)
+    );
     const sel = $('#s_model');
     sel.innerHTML = '<option value="">auto (first loaded)</option>' +
-      (models || []).map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('');
+      chatModels.map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('');
     sel.value = settings.model || '';
   } catch {}
 
@@ -952,10 +955,10 @@ $('#checkUpdate').onclick = async () => {
   if (r.update_available) toast('Update available', 'ok');
 };
 $('#applyUpdate').onclick = async e => {
-  if (!confirm('Install the update and restart the harness?')) return;
+  if (!confirm('Install the update now? (Restart `uh` afterwards to load updated server code.)')) return;
   e.target.disabled = true; e.target.textContent = 'Updating…';
   const r = await api('/api/update/apply', { method: 'POST' });
-  if (r.ok) { toast('Updated — restarting…', 'ok'); setTimeout(() => location.reload(), 1500); }
+  if (r.ok) { toast(`Updated to ${r.current} — restart uh to apply`, 'ok'); setTimeout(() => location.reload(), 1500); }
   else toast(r.error || 'Update failed', 'err');
   e.target.disabled = false; e.target.textContent = 'Install update';
 };

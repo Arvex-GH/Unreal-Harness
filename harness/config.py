@@ -89,6 +89,11 @@ class Config:
             for k, v in raw.items():
                 if k in known:
                     setattr(cfg, k, v)
+        if cfg.repo_url.rstrip("/").removesuffix(".git") in (
+            "",
+            "https://github.com/unreal-harness/unreal-harness",
+        ):
+            cfg.repo_url = "https://github.com/Arvex-GH/Unreal-Harness"
         cfg._autodetect()
         return cfg
 

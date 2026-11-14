@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import __version__
+from . import __version__, _read_version
 from .agent import Agent, AgentContext, suggest_title
 from .config import DATA_DIR, Config, ensure_dirs
 from .db import ChatStore
@@ -100,7 +100,7 @@ async def index() -> str:
 
 @app.get("/api/version")
 async def version():
-    return {"version": __version__, "data_dir": str(DATA_DIR)}
+    return {"version": _read_version(), "data_dir": str(DATA_DIR)}
 
 
 # ----------------------------------------------------------------------- chats
@@ -153,15 +153,12 @@ async def post_message(chat_id: str, body: MessageIn):
     if body.autopilot is not None:
         state.cfg.autopilot = body.autopilot
 
-    if is_first:
-        async def _title():
-            try:
-                title = await suggest_title(state.llm, body.content)
-                if title:
-                    state.store.rename_chat(chat_id, title)
-            except Exception:
-                pass
-        asyncio.create_task(_title())
+    # Set a quick provisional title right away without hitting LM Studio concurrently
+    # while the main agent turn is about to stream; LLM title refinement runs after the turn.
+    if is_first and (chat.get("title") or "New chat") == "New chat":
+        quick = body.content.strip().replace("\n", " ")[:48]
+        if quick and len(body.content.split()) <= 5:
+            state.store.rename_chat(chat_id, quick)
     return {"ok": True, "first": is_first}
 
 
@@ -210,6 +207,24 @@ async def stream(chat_id: str, request: Request):
         except Exception as e:  # noqa: BLE001
             await queue.put({"type": "error", "error": f"{type(e).__name__}: {e}"})
         finally:
+            try:
+                chat_now = state.store.get_chat(chat_id)
+                msgs_now = state.store.messages(chat_id)
+                if (
+                    chat_now
+                    and (chat_now.get("title") or "New chat") == "New chat"
+                    and msgs_now
+                    and not cancel.is_set()
+                ):
+                    first_user = next(
+                        (m["content"] for m in msgs_now if m.get("role") == "user"), ""
+                    )
+                    if first_user:
+                        title = await suggest_title(state.llm, first_user)
+                        if title:
+                            state.store.rename_chat(chat_id, title)
+            except Exception:
+                pass
             await queue.put({"type": "__end__"})
             state.running[chat_id] = False
 
@@ -364,7 +379,7 @@ async def system_paths():
 # -------------------------------------------------------------------- updates
 @app.get("/api/update/check")
 async def update_check():
-    return await updater.check(state.cfg)
+    return await updater.check(state.cfg, force=True)
 
 
 @app.post("/api/update/apply")

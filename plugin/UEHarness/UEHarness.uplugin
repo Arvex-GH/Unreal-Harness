@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 1,
-	"VersionName": "1.0.0",
+	"Version": 2,
+	"VersionName": "1.0.1",
 	"FriendlyName": "Unreal Harness",
 	"Description": "Native high-speed bridge for the Unreal Harness AI agent. Gives the agent direct, transactional control of the editor: blueprint graph authoring, assets, levels, materials, logs and console.",
 	"Category": "Editor",

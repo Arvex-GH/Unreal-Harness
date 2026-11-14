@@ -191,6 +191,27 @@ def test_prune():
     print(f"✓ context pruning: {len(msgs)} -> {len(out)} messages, ~{total} tokens")
 
 
+def test_tool_schemas_strict_json_schema():
+    from tests.mock_lmstudio import validate_tool_schemas
+
+    cfg = Config()
+    cfg.allow_shell = True
+    cfg.allow_network = True
+    schemas = registry.schemas(cfg)
+    assert len(schemas) == 49, f"expected 49 tools, got {len(schemas)}"
+    err = validate_tool_schemas(schemas)
+    assert err is None, err
+
+    # Specifically verify the previously broken tools now have proper defaults & object items
+    by_name = {s["function"]["name"]: s["function"]["parameters"]["properties"] for s in schemas}
+    assert "enum" not in by_name["fs_list"]["path"] and by_name["fs_list"]["path"]["default"] == "."
+    assert "enum" not in by_name["fs_grep"]["path"] and by_name["fs_grep"]["path"]["default"] == "."
+    assert "enum" not in by_name["ue_search_assets"]["path"] and by_name["ue_search_assets"]["path"]["default"] == "/Game"
+    assert by_name["bp_build"]["nodes"]["items"]["type"] == "object"
+    assert by_name["ue_run_batch"]["calls"]["items"]["type"] == "object"
+    print(f"✓ all {len(schemas)} tool JSON schemas pass strict llama.cpp grammar validation")
+
+
 a: list = []
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
