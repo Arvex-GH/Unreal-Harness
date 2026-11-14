@@ -295,7 +295,7 @@ void {cls}::BeginPlay()
         path = proj / "Config" / section_file
         path.parent.mkdir(parents=True, exist_ok=True)
         lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.exists() else []
-        out, cur, seen = [], None, set()
+        out, cur, seen, found_section = [], None, set(), False
         for line in lines:
             s = line.strip()
             if s.startswith("[") and s.endswith("]"):
@@ -303,7 +303,10 @@ void {cls}::BeginPlay()
                     for k, v in values.items():
                         if k not in seen:
                             out.append(f"{k}={v}")
+                            seen.add(k)
                 cur = s[1:-1]
+                if cur == section:
+                    found_section = True
             if cur == section and "=" in s and not s.startswith(";"):
                 k = s.split("=", 1)[0].strip()
                 if k in values:
@@ -311,9 +314,11 @@ void {cls}::BeginPlay()
                     seen.add(k)
                     continue
             out.append(line)
-        if cur != section:
-            out += ["", f"[{section}]"] + [f"{k}={v}" for k, v in values.items()]
-        elif seen != set(values):
+        if not found_section:
+            if out and out[-1].strip() != "":
+                out.append("")
+            out += [f"[{section}]"] + [f"{k}={v}" for k, v in values.items()]
+        elif cur == section:
             for k, v in values.items():
                 if k not in seen:
                     out.append(f"{k}={v}")
@@ -358,8 +363,27 @@ void {cls}::BeginPlay()
 
 
 # ---------------------------------------------------------------- installer
+_INIT_BEGIN = "# BEGIN UNREAL HARNESS"
+_INIT_END = "# END UNREAL HARNESS"
+_INIT_SNIPPET = f"""{_INIT_BEGIN}
+try:
+    import unreal as _uh_unreal
+    _rc_cls = getattr(_uh_unreal, "RemoteControlSettings", None)
+    if _rc_cls is not None:
+        _rc_cdo = _uh_unreal.get_default_object(_rc_cls)
+        for _prop in ("enable_remote_python_execution", "allow_console_command_remote_execution"):
+            try:
+                _rc_cdo.set_editor_property(_prop, True)
+            except Exception:
+                pass
+except Exception:
+    pass
+{_INIT_END}
+"""
+
+
 class Installer:
-    """Installs the C++ bridge plugin + enables stock plugins."""
+    """Installs the C++ bridge plugin + configures Remote Control & Python."""
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -375,38 +399,215 @@ class Installer:
             return None
         return proj.parent / "Plugins" / "UEHarness"
 
+    def _uat_path(self) -> Path | None:
+        if not self.cfg.engine_path:
+            return None
+        eng = Path(self.cfg.engine_path)
+        rel = "Engine/Build/BatchFiles/RunUAT.bat" if platform.system() == "Windows" else "Engine/Build/BatchFiles/RunUAT.sh"
+        p = eng / rel
+        return p if p.exists() else None
+
+    def configure_remote_control(self) -> dict:
+        """Enable Remote Control + Python execution in .uproject, Config/*.ini, and init_unreal.py."""
+        proj = self.cfg.project_file
+        if not proj or not proj.exists():
+            return {"configured": False, "reason": "no project configured"}
+
+        enabled = [
+            n for n in ("RemoteControl", "PythonScriptPlugin", "EditorScriptingUtilities")
+            if self.ue.enable_plugin(n)
+        ]
+
+        rc_ini = self.ue.write_ini(
+            "DefaultRemoteControl.ini",
+            "/Script/RemoteControlCommon.RemoteControlSettings",
+            {
+                "bAutoStartWebServer": "True",
+                "bAutoStartWebSocketServer": "True",
+                "RemoteControlHttpServerPort": str(self.cfg.rc_port),
+                "bEnableRemotePythonExecution": "True",
+                "bAllowConsoleCommandRemoteExecution": "True",
+            },
+        )
+        self.ue.write_ini(
+            "DefaultEngine.ini",
+            "/Script/PythonScriptPlugin.PythonScriptPluginSettings",
+            {
+                "bRemoteExecution": "True",
+                "bDeveloperMode": "True",
+            },
+        )
+
+        # Startup Python hook: guarantees RemoteControlSettings allows Python in memory at boot
+        init_py = proj.parent / "Content" / "Python" / "init_unreal.py"
+        init_py.parent.mkdir(parents=True, exist_ok=True)
+        existing = init_py.read_text(encoding="utf-8", errors="ignore") if init_py.exists() else ""
+        if _INIT_BEGIN in existing and _INIT_END in existing:
+            pre = existing.split(_INIT_BEGIN, 1)[0]
+            post = existing.split(_INIT_END, 1)[1].lstrip("\r\n")
+            updated = pre.rstrip() + ("\n\n" if pre.strip() else "") + _INIT_SNIPPET + (("\n" + post) if post else "")
+        elif existing.strip():
+            updated = existing.rstrip() + "\n\n" + _INIT_SNIPPET
+        else:
+            updated = _INIT_SNIPPET
+        if updated != existing:
+            init_py.write_text(updated, encoding="utf-8")
+
+        return {
+            "configured": True,
+            "enabled_plugins": enabled,
+            "remote_control_ini": rc_ini,
+            "init_python": str(init_py),
+        }
+
+    def sync_existing_install(self) -> dict:
+        """Keep existing project plugin & Remote Control settings up to date after harness updates."""
+        proj = self.cfg.project_file
+        if not proj or not proj.exists():
+            return {"synced": False}
+
+        out: dict = {"synced": True}
+        if self.cfg.auto_install_bridge:
+            try:
+                out["remote_control"] = self.configure_remote_control()
+            except Exception as e:  # noqa: BLE001
+                out["rc_error"] = str(e)
+
+        src = self.plugin_source()
+        dst = self.plugin_target()
+        if src.exists() and dst and (dst / "UEHarness.uplugin").exists():
+            try:
+                src_desc = json.loads((src / "UEHarness.uplugin").read_text(encoding="utf-8-sig"))
+                dst_desc = json.loads((dst / "UEHarness.uplugin").read_text(encoding="utf-8-sig"))
+                needs_sync = (
+                    "EngineVersion" in dst_desc
+                    or int(dst_desc.get("Version", 0)) < int(src_desc.get("Version", 0))
+                    or dst_desc.get("VersionName") != src_desc.get("VersionName")
+                )
+                if needs_sync:
+                    shutil.copy2(src / "UEHarness.uplugin", dst / "UEHarness.uplugin")
+                    dst_src = dst / "Source"
+                    if dst_src.exists():
+                        shutil.rmtree(dst_src)
+                    shutil.copytree(src / "Source", dst_src)
+                    out["plugin_updated"] = str(dst)
+            except Exception as e:  # noqa: BLE001
+                out["plugin_sync_error"] = str(e)
+        return out
+
+    def _build_standalone_plugin(self, src: Path, dst: Path, timeout: int = 1200) -> dict:
+        """Build UEHarness standalone via RunUAT BuildPlugin (supports Blueprint-only projects)."""
+        uat = self._uat_path()
+        if not uat:
+            return {"ok": False, "error": "RunUAT not found (set engine_path in Settings)"}
+        import tempfile
+
+        plat = self.ue._platform_bin()
+        with tempfile.TemporaryDirectory(prefix="ueharness_uat_") as tmp:
+            pkg_dir = Path(tmp) / "UEHarness"
+            cmd = [
+                str(uat),
+                "BuildPlugin",
+                f"-Plugin={src / 'UEHarness.uplugin'}",
+                f"-Package={pkg_dir}",
+                f"-TargetPlatforms={plat}",
+                "-Rocket",
+            ]
+            t0 = time.time()
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=timeout, errors="replace"
+                )
+            except subprocess.TimeoutExpired:
+                return {"ok": False, "error": f"BuildPlugin timed out after {timeout}s"}
+            out = (proc.stdout or "") + (proc.stderr or "")
+            if proc.returncode != 0 or not (pkg_dir / "Binaries").exists():
+                errors = [l for l in out.splitlines() if ": error" in l or "ERROR:" in l]
+                return {
+                    "ok": False,
+                    "exit_code": proc.returncode,
+                    "errors": errors[-40:],
+                    "log_tail": out[-6000:],
+                    "duration_ms": int((time.time() - t0) * 1000),
+                }
+            # Remove EngineVersion stamp from packaged .uplugin so patch/minor updates never prompt
+            pkg_uplugin = pkg_dir / "UEHarness.uplugin"
+            if pkg_uplugin.exists():
+                try:
+                    desc = json.loads(pkg_uplugin.read_text(encoding="utf-8-sig"))
+                    desc.pop("EngineVersion", None)
+                    desc["Installed"] = False
+                    pkg_uplugin.write_text(json.dumps(desc, indent=2), encoding="utf-8")
+                except Exception:
+                    shutil.copy2(src / "UEHarness.uplugin", pkg_uplugin)
+            if dst.exists():
+                shutil.rmtree(dst)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(pkg_dir, dst)
+            return {"ok": True, "duration_ms": int((time.time() - t0) * 1000)}
+
     def install_plugin(self, build: bool = True, enable_rc: bool = True) -> dict:
         src = self.plugin_source()
         dst = self.plugin_target()
-        if not dst:
+        if not dst or not self.cfg.project_file:
             return {"error": "no project configured",
                     "hint": "the plugin is copied into <Project>/Plugins/UEHarness"}
         if not src.exists():
             return {"error": f"plugin source missing: {src}"}
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists():
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst)
 
-        result: dict = {"installed_to": str(dst)}
+        result: dict = {}
         try:
             if enable_rc:
-                result["enabled_plugins"] = [
-                    n for n in ("RemoteControl", "PythonScriptPlugin", "EditorScriptingUtilities")
-                    if self.ue.enable_plugin(n)
-                ]
-                # RemoteControl is a stock plugin; it lives in the engine, so a
-                # .uproject entry is enough to load it with the project.
+                rc_info = self.configure_remote_control()
+                result["enabled_plugins"] = rc_info.get("enabled_plugins", [])
+                result["remote_control_ini"] = rc_info.get("remote_control_ini", "")
         except Exception as e:  # noqa: BLE001
             result["plugin_enable_error"] = str(e)
 
         is_cpp = (self.cfg.project_file.parent / "Source").exists()
-        if not is_cpp:
-            result["warning"] = (
-                "This is a Blueprint-only project, so the native plugin cannot compile. "
-                "Two options: (a) convert to C++ (Tools > New C++ Class), or (b) rely on the "
-                "Remote Control + Python transport, which is already enabled.")
-        elif build:
-            result["build"] = self.ue.build(timeout=1200)
-        result["next"] = "Restart the editor. The bridge listens on port %d" % self.cfg.bridge_port
+        if is_cpp:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            self.ue.enable_plugin("UEHarness")
+            result["installed_to"] = str(dst)
+            if build:
+                result["build"] = self.ue.build(timeout=1200)
+        else:
+            if build and self._uat_path():
+                uat_res = self._build_standalone_plugin(src, dst)
+                result["build"] = uat_res
+                if uat_res.get("ok"):
+                    self.ue.enable_plugin("UEHarness")
+                    result["installed_to"] = str(dst)
+                else:
+                    # Do not leave unbuilt C++ module in a Blueprint-only project without binaries
+                    if dst.exists() and not (dst / "Binaries").exists():
+                        shutil.rmtree(dst, ignore_errors=True)
+                    result["warning"] = (
+                        "Blueprint-only project without a C++ build toolchain: "
+                        "configured Remote Control + Remote Python execution instead "
+                        "(all tools work via Remote Control after restarting Unreal Editor)."
+                    )
+            else:
+                # Copy source only if user already has Binaries, otherwise rely on RC + Python cleanly
+                if dst.exists() and (dst / "Binaries").exists():
+                    shutil.copy2(src / "UEHarness.uplugin", dst / "UEHarness.uplugin")
+                    if (dst / "Source").exists():
+                        shutil.rmtree(dst / "Source")
+                    shutil.copytree(src / "Source", dst / "Source")
+                    result["installed_to"] = str(dst)
+                else:
+                    if dst.exists() and not (dst / "Binaries").exists():
+                        shutil.rmtree(dst, ignore_errors=True)
+                    result["warning"] = (
+                        "Blueprint-only project: enabled Remote Control + Remote Python execution "
+                        "in Config/DefaultRemoteControl.ini (set engine_path and click Install engine "
+                        "bridge with Visual Studio installed if you also want the compiled C++ socket bridge)."
+                    )
+        result["next"] = (
+            f"Restart Unreal Editor once. Native bridge uses :{self.cfg.bridge_port}; "
+            f"Remote Control + Python uses :{self.cfg.rc_port}."
+        )
         return result

@@ -38,6 +38,10 @@ class AppState:
         self.installer = Installer(self.cfg)
         self.approvals: dict[str, asyncio.Future] = {}
         self.running: dict[str, bool] = {}
+        try:
+            self.installer.sync_existing_install()
+        except Exception:
+            pass
 
     def reload_config(self) -> None:
         self.cfg = Config.load()
@@ -45,6 +49,10 @@ class AppState:
         self.ue = UnrealClient(self.cfg)
         self.uectl = UEController(self.cfg)
         self.installer = Installer(self.cfg)
+        try:
+            self.installer.sync_existing_install()
+        except Exception:
+            pass
 
 
 state = AppState()

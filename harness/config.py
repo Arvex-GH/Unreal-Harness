@@ -186,13 +186,16 @@ def discover_engine(project_path: str = "") -> Path | None:
     """Find a UE install from the .uproject association or the default install dirs."""
     if project_path:
         try:
-            data = json.loads(Path(project_path).read_text(encoding="utf-8-sig"))
-            assoc = data.get("EngineAssociation", "")
-            if assoc and not assoc.startswith("{") and len(assoc) > 3:
+            proj = Path(project_path)
+            if proj.is_dir():
+                cands = sorted(proj.glob("*.uproject"))
+                proj = cands[0] if cands else proj
+            data = json.loads(proj.read_text(encoding="utf-8-sig"))
+            assoc = str(data.get("EngineAssociation", "")).strip()
+            if assoc and not assoc.startswith("{"):
                 p = Path(assoc)
-                if p.exists():
+                if p.is_dir() and (p / "Engine").exists():
                     return p
-                # registry-style version => probe standard locations
                 cand = _probe_engine_versions(assoc)
                 if cand:
                     return cand
@@ -202,27 +205,68 @@ def discover_engine(project_path: str = "") -> Path | None:
 
 
 def _probe_engine_versions(version: str | None) -> Path | None:
+    if sys.platform == "win32":
+        launcher_dat = Path(os.environ.get("ProgramData", "C:/ProgramData")) / (
+            "Epic/UnrealEngineLauncher/LauncherInstalled.dat"
+        )
+        if launcher_dat.exists():
+            try:
+                installed = json.loads(
+                    launcher_dat.read_text(encoding="utf-8-sig")
+                ).get("InstallationList", [])
+                ue_entries = [
+                    it for it in installed
+                    if str(it.get("AppName", "")).startswith("UE_")
+                    and it.get("InstallLocation")
+                    and Path(it["InstallLocation"]).exists()
+                ]
+                if version:
+                    v_norm = ".".join(version.split(".")[:2])
+                    for it in ue_entries:
+                        app = str(it.get("AppName", ""))
+                        if app == f"UE_{v_norm}" or version.replace(".", "") in app.replace(".", ""):
+                            return Path(it["InstallLocation"])
+                elif ue_entries:
+                    ue_entries.sort(key=lambda it: str(it.get("AppName", "")))
+                    return Path(ue_entries[-1]["InstallLocation"])
+            except Exception:
+                pass
+
     roots: list[Path] = []
     if sys.platform == "win32":
         for env in ("ProgramFiles", "ProgramFiles(x86)"):
             base = os.environ.get(env)
             if base:
                 roots.append(Path(base) / "Epic Games")
+        for drive in ("C:", "D:", "E:", "F:"):
+            roots.append(Path(f"{drive}/Epic Games"))
     elif sys.platform == "darwin":
         roots.append(Path("/Users/Shared/Epic Games"))
     else:
         roots += [Path("/opt/UnrealEngine"), Path.home() / "UnrealEngine",
                   Path("/usr/local/UnrealEngine")]
+    seen_roots: set[Path] = set()
+    all_cands: list[Path] = []
     for root in roots:
-        if not root.exists():
+        if root in seen_roots or not root.exists():
             continue
+        seen_roots.add(root)
         cands = [d for d in root.iterdir() if d.is_dir() and d.name.startswith("UE_")]
         if version:
-            exact = [d for d in cands if version.replace(".", "") in d.name.replace(".", "")]
+            v_norm = ".".join(version.split(".")[:2])
+            exact = [
+                d for d in cands
+                if d.name == f"UE_{v_norm}"
+                or version.replace(".", "") in d.name.replace(".", "")
+            ]
             if exact:
-                return exact[0]
-        if cands:
-            return sorted(cands, key=lambda d: d.name)[-1]
+                return sorted(exact, key=lambda d: d.name)[-1]
+        all_cands.extend(cands)
+    if all_cands:
+        def _ver_key(d: Path) -> tuple[int, ...]:
+            nums = [int(x) for x in d.name.removeprefix("UE_").split(".") if x.isdigit()]
+            return tuple(nums) if nums else (0,)
+        return sorted(all_cands, key=_ver_key)[-1]
     return None
 
 

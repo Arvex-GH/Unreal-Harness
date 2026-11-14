@@ -508,25 +508,10 @@ else:
       parameters=req(P(path=S("Widget blueprint path, e.g. /Game/UI/WBP_Menu"),
                        title_text=S("Optional text block content")), "path"))
 def umg_create_widget(ctx, path: str, title_text: str = ""):
-    code = f'''
-import unreal, json
-path = {path!r}
-name = path.split('/')[-1]
-pkg = '/'.join(path.split('/')[:-1])
-if unreal.EditorAssetLibrary.does_asset_exist(path):
-    print('__HARNESS__' + json.dumps({{'existed': True, 'path': path}}))
-else:
-    tools = unreal.AssetToolsHelpers.get_asset_tools()
-    factory = unreal.WidgetBlueprintFactory()
-    factory.set_editor_property('parent_class', unreal.UserWidget)
-    wbp = tools.create_asset(name, pkg, unreal.WidgetBlueprint, factory)
-    unreal.EditorAssetLibrary.save_asset(path)
-    print('__HARNESS__' + json.dumps({{'created': True, 'path': path}}))
-'''
-    ok, res, err = _ue(ctx).python(code)
-    if not ok:
-        return {"error": err}
-    return {"output": (res or {}).get("output", "")}
+    ok, res, err = _ue(ctx).call(
+        "umg.create_widget", {"path": path, "title_text": title_text}
+    )
+    return _nr(ctx, res, err)
 
 
 # ---------------------------------------------------------------- input

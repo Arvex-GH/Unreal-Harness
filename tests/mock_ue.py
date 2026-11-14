@@ -78,10 +78,11 @@ class MockEditor:
     # --------------------------------------------------------------- verbs
     def cmd_handshake(self, a):
         return True, {
-            "plugin": "UEHarness", "protocol": 2, "engine_version": "5.5.0-mock",
+            "plugin": "UEHarness", "protocol": 2, "engine_version": "5.8.4-mock",
             "project": "MockGame", "pie_running": self.pie,
             "verbs": ["editor.console", "editor.log", "bp.create", "bp.add_node",
-                      "bp.connect", "bp.build_graph", "bp.compile", "actor.find"],
+                      "bp.connect", "bp.build_graph", "bp.compile", "umg.create_widget",
+                      "actor.find"],
         }, ""
 
     cmd_ping = cmd_handshake
@@ -294,6 +295,21 @@ class MockEditor:
     def cmd_python_exec(self, a):
         code = a.get("code", "")
         return True, {"output": f"[mock python] would run {len(code)} chars"}, ""
+
+    def cmd_umg_create_widget(self, a):
+        path = a.get("path", "").split(".")[0].rstrip("/")
+        title = a.get("title_text", "")
+        existed = path in self.blueprints
+        if not existed:
+            self.blueprints[path] = {
+                "parent": "UserWidget",
+                "variables": {},
+                "nodes": [],
+                "status": "UpToDate",
+                "title_text": title,
+            }
+        return True, {"path": path, "created": not existed, "existed": existed,
+                      "title_text": title}, ""
 
 
 class Handler(socketserver.StreamRequestHandler):

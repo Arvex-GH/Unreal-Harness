@@ -5,6 +5,7 @@
 #include "HAL/ThreadSafeBool.h"
 
 class FSocket;
+class FRunnableThread;
 class FUEHarnessWorker;
 
 /**
@@ -33,6 +34,7 @@ public:
 private:
 	FSocket* Listener = nullptr;
 	TSharedPtr<FUEHarnessWorker> Worker;
+	FRunnableThread* Thread = nullptr;
 	FThreadSafeBool bRunning;
 	int32 BoundPort = 0;
 };
