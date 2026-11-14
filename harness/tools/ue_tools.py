@@ -319,27 +319,76 @@ def bp_compile(ctx, bp: str):
 
 
 # --------------------------------------------------------------------- level
+@tool("level_new", "Create and open a new level (with an optional ground floor mesh and "
+      "default viewport camera framing).", "level", risk="write",
+      parameters=P(path=S("Level asset path", default="/Game/Maps/NewLevel"),
+                   add_floor=B("Spawn a default ground Floor mesh", True),
+                   save=B("Save the level asset immediately", True)))
+def level_new(ctx, path: str = "/Game/Maps/NewLevel", add_floor: bool = True,
+              save: bool = True):
+    ok, res, err = _ue(ctx).call(
+        "level.new", {"path": path, "add_floor": add_floor, "save": save}
+    )
+    return _nr(ctx, res, err)
+
+
+@tool("level_camera", "Get or set the active perspective editor viewport camera. Pass x/y/z "
+      "and either look_x/look_y/look_z (target point to look at) or pitch/yaw/roll.",
+      "level", risk="write",
+      parameters=P(x=N("Camera X"), y=N("Camera Y"), z=N("Camera Z"),
+                   look_x=N("Look-at target X"), look_y=N("Look-at target Y"),
+                   look_z=N("Look-at target Z"),
+                   pitch=N("Pitch degrees"), yaw=N("Yaw degrees"), roll=N("Roll degrees")))
+def level_camera(ctx, **kw):
+    args = {k: v for k, v in kw.items() if v is not None}
+    if args:
+        args["set"] = True
+    ok, res, err = _ue(ctx).call("level.camera", args)
+    return _nr(ctx, res, err)
+
+
 @tool("level_find_actors", "List actors in the current level, optionally filtered by class.",
-      "level", parameters=P(**{"class": S("Class name substring"), "limit": N("Max", 200)}))
+      "level", parameters=P(**{"class": S("Class or label substring"), "limit": N("Max", 200)}))
 def level_find_actors(ctx, limit: int = 200, **kw):
     ok, res, err = _ue(ctx).call("actor.find", {"class": kw.get("class", ""), "limit": limit})
     return _nr(ctx, res, err)
 
 
-@tool("level_spawn", "Spawn an actor in the current level by class name or Blueprint path.",
+@tool("level_spawn", "Spawn an actor in the current level. Supports shapes ('Cube', "
+      "'Sphere', 'Cylinder', 'Cone', 'Plane'), lighting/atmosphere classes "
+      "('DirectionalLight', 'SkyAtmosphere', 'SkyLight', 'ExponentialHeightFog', "
+      "'VolumetricCloud', 'PointLight', 'SpotLight', 'PostProcessVolume'), any UE Actor "
+      "class, or a /Game/... Blueprint path.",
       "level", risk="write",
-      parameters=req(P(**{"class": S("Class name or /Game/... blueprint path"),
-                          "x": N("X", 0), "y": N("Y", 0), "z": N("Z", 0)}), "class"))
+      parameters=req(P(**{
+          "class": S("Shape ('Cube', 'Sphere'...), Actor class ('DirectionalLight', 'SkyAtmosphere'...), or /Game/... blueprint path"),
+          "x": N("X", 0), "y": N("Y", 0), "z": N("Z", 0),
+          "pitch": N("Pitch degrees", 0), "yaw": N("Yaw degrees", 0), "roll": N("Roll degrees", 0),
+          "scale": N("Uniform scale (optional)"),
+          "sx": N("Scale X (optional)"), "sy": N("Scale Y (optional)"), "sz": N("Scale Z (optional)"),
+          "label": S("Optional actor label in Outliner"),
+      }), "class"))
 def level_spawn(ctx, **kw):
-    ok, res, err = _ue(ctx).call("actor.spawn", {
-        "class": kw["class"], "x": kw.get("x", 0), "y": kw.get("y", 0), "z": kw.get("z", 0)})
+    args: dict = {
+        "class": kw["class"],
+        "x": kw.get("x", 0), "y": kw.get("y", 0), "z": kw.get("z", 0),
+        "pitch": kw.get("pitch", 0), "yaw": kw.get("yaw", 0), "roll": kw.get("roll", 0),
+    }
+    for k in ("scale", "sx", "sy", "sz", "label"):
+        if kw.get(k) not in (None, ""):
+            args[k] = kw[k]
+    ok, res, err = _ue(ctx).call("actor.spawn", args)
     return _nr(ctx, res, err)
 
 
-@tool("level_set_property", "Set any UPROPERTY on an actor instance in the level "
-      "(Unreal text syntax, e.g. 'X=100,Y=0,Z=50').", "level", risk="write",
-      parameters=req(P(actor=S("Actor name in the level"), property=S("Property name"),
-                       value=S("Value in Unreal text format")), "actor", "property", "value"))
+@tool("level_set_property", "Set any UPROPERTY on an actor OR its components in the level "
+      "(e.g. 'Rotation', 'Scale', 'Intensity', 'LightColor', 'bAtmosphereSunLight', "
+      "'bRealTimeCapture', 'FogDensity', 'FogInscatteringLuminance').",
+      "level", risk="write",
+      parameters=req(P(actor=S("Actor name or label in the level"),
+                       property=S("Property name on actor or component"),
+                       value=S("Value (number, true/false, or Unreal struct syntax like '(R=1.0,G=0.45,B=0.18,A=1.0)')")),
+                     "actor", "property", "value"))
 def level_set_property(ctx, actor: str, property: str, value: str):
     ok, res, err = _ue(ctx).call("actor.set_property",
                                  {"actor": actor, "property": property, "value": value})
@@ -575,12 +624,61 @@ def proj_default_map(ctx, map: str = "", game_mode: str = ""):
 
 
 # ---------------------------------------------------------------- utilities
-@tool("ue_screenshot", "Capture the editor viewport as a PNG in the project's Saved folder, "
-      "so you can visually verify layout and lighting.", "unreal",
-      parameters=P(name=S("File name", default="harness_shot")))
+@tool("ue_screenshot", "Capture the active editor viewport to a PNG in Saved/Screenshots/Harness "
+      "and return `path`, `image_url`, and `markdown` so it renders directly in chat.",
+      "unreal",
+      parameters=P(name=S("File name (without extension)", default="harness_shot")))
 def ue_screenshot(ctx, name: str = "harness_shot"):
-    ok, res, err = _ue(ctx).call("editor.console", {"command": f"HighResShot 1920x1080"})
-    return {"ok": ok, "note": "screenshot cmd issued", **(res or {}), "error": err}
+    import time
+    from pathlib import Path
+    from urllib.parse import quote
+
+    t0 = time.time()
+    ok, res, err = _ue(ctx).call("viewport.screenshot", {"name": name})
+    if not ok:
+        return {"ok": False, "error": err}
+
+    data = dict(res or {})
+    raw_path = data.get("path", "")
+    saved_path = Path(raw_path) if raw_path else None
+
+    if data.get("queued") and saved_path is not None:
+        deadline = time.time() + 5.0
+        nudged = False
+        while time.time() < deadline:
+            if saved_path.exists() and saved_path.stat().st_size > 0:
+                break
+            if not nudged and time.time() - t0 > 1.0:
+                nudged = True
+                try:
+                    _ue(ctx).python(
+                        "import unreal; unreal.get_editor_subsystem("
+                        "unreal.LevelEditorSubsystem).editor_invalidate_viewports()"
+                    )
+                except Exception:
+                    pass
+            time.sleep(0.15)
+        if not saved_path.exists() and ctx.cfg.project_dir:
+            shots_root = ctx.cfg.project_dir / "Saved" / "Screenshots"
+            if shots_root.exists():
+                recent = [
+                    p for p in shots_root.rglob("*.png")
+                    if p.stat().st_mtime >= t0 - 1.0 and p.stat().st_size > 0
+                ]
+                if recent:
+                    saved_path = max(recent, key=lambda p: p.stat().st_mtime)
+
+    if saved_path is not None:
+        resolved_str = str(saved_path)
+        ts = int(time.time() * 1000)
+        qpath = quote(resolved_str, safe="")
+        img_url = f"/api/files/image?path={qpath}&t={ts}"
+        data["path"] = resolved_str
+        data["exists"] = saved_path.exists()
+        if saved_path.exists():
+            data["image_url"] = img_url
+            data["markdown"] = f"![{name}]({img_url})"
+    return {"ok": True, **data}
 
 
 @tool("ue_live_coding", "Trigger Live Coding compile through the running editor (C++ "

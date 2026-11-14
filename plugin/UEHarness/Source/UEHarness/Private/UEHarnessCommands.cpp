@@ -16,6 +16,16 @@
 #include "Components/CanvasPanelSlot.h"
 #include "Components/PanelWidget.h"
 #include "Components/TextBlock.h"
+#include "Components/StaticMeshComponent.h"
+#include "Components/SkyLightComponent.h"
+#include "Engine/StaticMeshActor.h"
+#include "Engine/StaticMesh.h"
+#include "ImageUtils.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "LevelEditorSubsystem.h"
+#include "LevelEditorViewport.h"
+#include "Subsystems/UnrealEditorSubsystem.h"
+#include "UnrealClient.h"
 #include "Widgets/Layout/Anchors.h"
 #include "UObject/Package.h"
 #include "Misc/PackageName.h"
@@ -338,6 +348,9 @@ namespace UEHarness
 			MakeShared<FJsonValueString>(TEXT("bp.compile")),
 			MakeShared<FJsonValueString>(TEXT("bp.list_graphs")),
 			MakeShared<FJsonValueString>(TEXT("umg.create_widget")),
+			MakeShared<FJsonValueString>(TEXT("level.new")),
+			MakeShared<FJsonValueString>(TEXT("level.camera")),
+			MakeShared<FJsonValueString>(TEXT("viewport.screenshot")),
 			MakeShared<FJsonValueString>(TEXT("actor.spawn")),
 			MakeShared<FJsonValueString>(TEXT("actor.find")),
 			MakeShared<FJsonValueString>(TEXT("actor.set_property")),
@@ -839,6 +852,181 @@ namespace UEHarness
 			return bSuccess;
 		}
 
+		// ----------------------------------------------------------- levels
+		if (Cmd == TEXT("level.new"))
+		{
+			FString Path = TEXT("/Game/Maps/NewLevel");
+			Args->TryGetStringField(TEXT("path"), Path);
+			const FString PackageName = FPackageName::ObjectPathToPackageName(Path);
+			const bool bAddFloor = GetBool(Args, TEXT("add_floor"), true);
+			const bool bSave = GetBool(Args, TEXT("save"), true);
+
+			ULevelEditorSubsystem* LevelSub = GEditor ? GEditor->GetEditorSubsystem<ULevelEditorSubsystem>() : nullptr;
+			if (!LevelSub)
+			{
+				Err = TEXT("LevelEditorSubsystem unavailable");
+				return false;
+			}
+			if (!LevelSub->NewLevel(PackageName))
+			{
+				Err = FString::Printf(TEXT("failed to create level at %s"), *PackageName);
+				return false;
+			}
+
+			UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+			if (bAddFloor && World)
+			{
+				FActorSpawnParameters FloorParams;
+				FloorParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+				if (AStaticMeshActor* Floor = World->SpawnActor<AStaticMeshActor>(
+					AStaticMeshActor::StaticClass(), FVector(0.0, 0.0, -50.0), FRotator::ZeroRotator, FloorParams))
+				{
+					Floor->SetMobility(EComponentMobility::Static);
+					if (UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube")))
+					{
+						Floor->GetStaticMeshComponent()->SetStaticMesh(CubeMesh);
+					}
+					Floor->SetActorScale3D(FVector(50.0, 50.0, 1.0));
+					Floor->SetActorLabel(TEXT("Floor"));
+				}
+			}
+
+			if (UUnrealEditorSubsystem* EdSub = GEditor ? GEditor->GetEditorSubsystem<UUnrealEditorSubsystem>() : nullptr)
+			{
+				const FVector CamLoc(420.0, -180.0, 170.0);
+				const FRotator CamRot = UKismetMathLibrary::FindLookAtRotation(CamLoc, FVector(0.0, 0.0, 50.0));
+				EdSub->SetLevelViewportCameraInfo(CamLoc, CamRot);
+			}
+
+			if (bSave)
+			{
+				UEditorAssetLibrary::SaveAsset(PackageName, false);
+			}
+			Out->SetStringField(TEXT("path"), PackageName);
+			Out->SetBoolField(TEXT("floor_added"), bAddFloor);
+			return true;
+		}
+
+		if (Cmd == TEXT("level.camera"))
+		{
+			UUnrealEditorSubsystem* EdSub = GEditor ? GEditor->GetEditorSubsystem<UUnrealEditorSubsystem>() : nullptr;
+			if (!EdSub)
+			{
+				Err = TEXT("UnrealEditorSubsystem unavailable");
+				return false;
+			}
+			const bool bSet = GetBool(Args, TEXT("set"), false)
+				|| Args->HasField(TEXT("x")) || Args->HasField(TEXT("y")) || Args->HasField(TEXT("z"));
+			if (bSet)
+			{
+				FVector CurLoc = FVector::ZeroVector;
+				FRotator CurRot = FRotator::ZeroRotator;
+				EdSub->GetLevelViewportCameraInfo(CurLoc, CurRot);
+				const FVector Loc(
+					GetNum(Args, TEXT("x"), CurLoc.X),
+					GetNum(Args, TEXT("y"), CurLoc.Y),
+					GetNum(Args, TEXT("z"), CurLoc.Z));
+				FRotator Rot(
+					GetNum(Args, TEXT("pitch"), CurRot.Pitch),
+					GetNum(Args, TEXT("yaw"), CurRot.Yaw),
+					GetNum(Args, TEXT("roll"), CurRot.Roll));
+				if (Args->HasField(TEXT("look_x")) || Args->HasField(TEXT("look_y")) || Args->HasField(TEXT("look_z")))
+				{
+					const FVector Target(
+						GetNum(Args, TEXT("look_x"), 0.0),
+						GetNum(Args, TEXT("look_y"), 0.0),
+						GetNum(Args, TEXT("look_z"), 0.0));
+					Rot = UKismetMathLibrary::FindLookAtRotation(Loc, Target);
+				}
+				EdSub->SetLevelViewportCameraInfo(Loc, Rot);
+				if (ULevelEditorSubsystem* LevelSub = GEditor->GetEditorSubsystem<ULevelEditorSubsystem>())
+				{
+					LevelSub->EditorInvalidateViewports();
+				}
+			}
+			FVector OutLoc = FVector::ZeroVector;
+			FRotator OutRot = FRotator::ZeroRotator;
+			EdSub->GetLevelViewportCameraInfo(OutLoc, OutRot);
+			Out->SetStringField(TEXT("location"), OutLoc.ToString());
+			Out->SetStringField(TEXT("rotation"), OutRot.ToString());
+			return true;
+		}
+
+		if (Cmd == TEXT("viewport.screenshot"))
+		{
+			FString Name = TEXT("harness_shot");
+			Args->TryGetStringField(TEXT("name"), Name);
+			Name = FPaths::MakeValidFileName(Name);
+			if (Name.IsEmpty()) { Name = TEXT("harness_shot"); }
+			if (Name.EndsWith(TEXT(".png"), ESearchCase::IgnoreCase))
+			{
+				Name.LeftChopInline(4);
+			}
+
+			FLevelEditorViewportClient* TargetVC = nullptr;
+			if (GEditor)
+			{
+				for (FLevelEditorViewportClient* VC : GEditor->GetLevelViewportClients())
+				{
+					if (VC && VC->Viewport && VC->IsPerspective())
+					{
+						TargetVC = VC;
+						break;
+					}
+				}
+				if (!TargetVC)
+				{
+					for (FLevelEditorViewportClient* VC : GEditor->GetLevelViewportClients())
+					{
+						if (VC && VC->Viewport)
+						{
+							TargetVC = VC;
+							break;
+						}
+					}
+				}
+			}
+			if (!TargetVC || !TargetVC->Viewport)
+			{
+				Err = TEXT("no active editor viewport found");
+				return false;
+			}
+
+			TargetVC->SetRealtime(true);
+			TargetVC->Invalidate(true, true);
+			TargetVC->Viewport->Draw(true);
+
+			const FIntPoint Size = TargetVC->Viewport->GetSizeXY();
+			TArray<FColor> Pixels;
+			if (Size.X <= 0 || Size.Y <= 0 || !TargetVC->Viewport->ReadPixels(Pixels) || Pixels.Num() == 0)
+			{
+				Err = TEXT("failed to read pixels from editor viewport");
+				return false;
+			}
+			for (FColor& C : Pixels)
+			{
+				C.A = 255;
+			}
+
+			TArray<uint8> PngData;
+			FImageUtils::ThumbnailCompressImageArray(Size.X, Size.Y, Pixels, PngData);
+
+			const FString OutDir = FPaths::ConvertRelativePathToFull(
+				FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"), TEXT("Harness")));
+			IFileManager::Get().MakeDirectory(*OutDir, true);
+			const FString OutPath = FPaths::Combine(OutDir, Name + TEXT(".png"));
+			if (!FFileHelper::SaveArrayToFile(PngData, *OutPath))
+			{
+				Err = FString::Printf(TEXT("failed to write screenshot: %s"), *OutPath);
+				return false;
+			}
+
+			Out->SetStringField(TEXT("path"), OutPath);
+			Out->SetNumberField(TEXT("width"), Size.X);
+			Out->SetNumberField(TEXT("height"), Size.Y);
+			return true;
+		}
+
 		// ----------------------------------------------------------- actors
 		if (Cmd == TEXT("actor.find"))
 		{
@@ -871,7 +1059,20 @@ namespace UEHarness
 			UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
 			if (!World) { Err = TEXT("no editor world"); return false; }
 
-			UClass* Cls = UClass::TryFindTypeSlow<UClass>(*ClassName);
+			FString BasicShapePath;
+			if (ClassName.Equals(TEXT("Cube"), ESearchCase::IgnoreCase)
+				|| ClassName.Equals(TEXT("Sphere"), ESearchCase::IgnoreCase)
+				|| ClassName.Equals(TEXT("Cylinder"), ESearchCase::IgnoreCase)
+				|| ClassName.Equals(TEXT("Cone"), ESearchCase::IgnoreCase)
+				|| ClassName.Equals(TEXT("Plane"), ESearchCase::IgnoreCase))
+			{
+				FString ProperShape = ClassName.Left(1).ToUpper() + ClassName.Mid(1).ToLower();
+				BasicShapePath = FString::Printf(TEXT("/Engine/BasicShapes/%s.%s"), *ProperShape, *ProperShape);
+			}
+
+			UClass* Cls = !BasicShapePath.IsEmpty()
+				? AStaticMeshActor::StaticClass()
+				: UClass::TryFindTypeSlow<UClass>(*ClassName);
 			if (!Cls) { Cls = UClass::TryFindTypeSlow<UClass>(*(TEXT("A") + ClassName)); }
 			if (!Cls)
 			{
@@ -881,12 +1082,50 @@ namespace UEHarness
 			if (!Cls) { Err = FString::Printf(TEXT("class not found: %s"), *ClassName); return false; }
 
 			const FVector Loc(GetNum(Args, TEXT("x")), GetNum(Args, TEXT("y")), GetNum(Args, TEXT("z")));
+			const FRotator Rot(
+				GetNum(Args, TEXT("pitch")),
+				GetNum(Args, TEXT("yaw")),
+				GetNum(Args, TEXT("roll")));
 
 			FActorSpawnParameters Params;
 			Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-			AActor* Actor = World->SpawnActor<AActor>(Cls, Loc, FRotator::ZeroRotator, Params);
+			AActor* Actor = World->SpawnActor<AActor>(Cls, Loc, Rot, Params);
 			if (!Actor) { Err = TEXT("spawn failed"); return false; }
+
+			if (USceneComponent* RootComp = Actor->GetRootComponent())
+			{
+				RootComp->SetMobility(EComponentMobility::Movable);
+			}
+
+			if (!BasicShapePath.IsEmpty())
+			{
+				if (AStaticMeshActor* SMA = Cast<AStaticMeshActor>(Actor))
+				{
+					if (UStaticMesh* ShapeMesh = LoadObject<UStaticMesh>(nullptr, *BasicShapePath))
+					{
+						SMA->GetStaticMeshComponent()->SetStaticMesh(ShapeMesh);
+					}
+				}
+			}
+
+			if (Args->HasField(TEXT("scale")) || Args->HasField(TEXT("sx"))
+				|| Args->HasField(TEXT("sy")) || Args->HasField(TEXT("sz")))
+			{
+				const double Uniform = GetNum(Args, TEXT("scale"), 1.0);
+				Actor->SetActorScale3D(FVector(
+					GetNum(Args, TEXT("sx"), Uniform),
+					GetNum(Args, TEXT("sy"), Uniform),
+					GetNum(Args, TEXT("sz"), Uniform)));
+			}
+
+			FString Label;
+			if (Args->TryGetStringField(TEXT("label"), Label) && !Label.IsEmpty())
+			{
+				Actor->SetActorLabel(Label);
+			}
+
 			Out->SetStringField(TEXT("name"), Actor->GetName());
+			Out->SetStringField(TEXT("label"), Actor->GetActorLabel());
 			Out->SetStringField(TEXT("path"), Actor->GetPathName());
 			return true;
 		}
@@ -902,22 +1141,91 @@ namespace UEHarness
 			UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
 			for (TActorIterator<AActor> It(World); It; ++It)
 			{
-				if (It->GetName() != ActorName) { continue; }
-				FProperty* Prop = FindFProperty<FProperty>(It->GetClass(), FName(*PropName));
-				if (!Prop) { Err = FString::Printf(TEXT("property '%s' not found"), *PropName); return false; }
-				It->Modify();
-				void* Addr = Prop->ContainerPtrToValuePtr<void>(*It);
+				if (It->GetName() != ActorName && !It->GetActorLabel().Equals(ActorName, ESearchCase::IgnoreCase))
+				{
+					continue;
+				}
+				AActor* TargetActor = *It;
+				TargetActor->Modify();
+
+				if (PropName.Equals(TEXT("Rotation"), ESearchCase::IgnoreCase)
+					|| PropName.Equals(TEXT("ActorRotation"), ESearchCase::IgnoreCase))
+				{
+					FRotator R = FRotator::ZeroRotator;
+					R.InitFromString(Value);
+					if (USceneComponent* RC = TargetActor->GetRootComponent())
+					{
+						RC->SetMobility(EComponentMobility::Movable);
+					}
+					TargetActor->SetActorRotation(R);
+					Out->SetBoolField(TEXT("set"), true);
+					return true;
+				}
+				if (PropName.Equals(TEXT("Location"), ESearchCase::IgnoreCase)
+					|| PropName.Equals(TEXT("ActorLocation"), ESearchCase::IgnoreCase))
+				{
+					FVector V = FVector::ZeroVector;
+					V.InitFromString(Value);
+					TargetActor->SetActorLocation(V);
+					Out->SetBoolField(TEXT("set"), true);
+					return true;
+				}
+				if (PropName.Equals(TEXT("Scale"), ESearchCase::IgnoreCase)
+					|| PropName.Equals(TEXT("ActorScale3D"), ESearchCase::IgnoreCase))
+				{
+					FVector S(1.0, 1.0, 1.0);
+					S.InitFromString(Value);
+					TargetActor->SetActorScale3D(S);
+					Out->SetBoolField(TEXT("set"), true);
+					return true;
+				}
+
+				UObject* TargetObj = TargetActor;
+				FProperty* Prop = FindFProperty<FProperty>(TargetActor->GetClass(), FName(*PropName));
+				if (!Prop)
+				{
+					for (UActorComponent* Comp : TargetActor->GetComponents())
+					{
+						if (!Comp) { continue; }
+						if (FProperty* CProp = FindFProperty<FProperty>(Comp->GetClass(), FName(*PropName)))
+						{
+							Prop = CProp;
+							TargetObj = Comp;
+							break;
+						}
+					}
+				}
+				if (!Prop)
+				{
+					Err = FString::Printf(TEXT("property '%s' not found on %s or its components"), *PropName, *ActorName);
+					return false;
+				}
+
+				TargetObj->Modify();
+				TargetObj->PreEditChange(Prop);
+				void* Addr = Prop->ContainerPtrToValuePtr<void>(TargetObj);
 #if UE_VERSION_OLDER_THAN(5, 1, 0)
-				const TCHAR* Imported = Prop->ImportText(*Value, Addr, PPF_None, It.operator->());
+				const TCHAR* Imported = Prop->ImportText(*Value, Addr, PPF_None, TargetObj);
 #else
-				const TCHAR* Imported = Prop->ImportText_Direct(*Value, Addr, It.operator->(), PPF_None);
+				const TCHAR* Imported = Prop->ImportText_Direct(*Value, Addr, TargetObj, PPF_None);
 #endif
+				FPropertyChangedEvent ChangeEv(Prop);
+				TargetObj->PostEditChangeProperty(ChangeEv);
+				if (UActorComponent* EditedComp = Cast<UActorComponent>(TargetObj))
+				{
+					EditedComp->MarkRenderStateDirty();
+					if (USkyLightComponent* SkyComp = Cast<USkyLightComponent>(EditedComp))
+					{
+						SkyComp->RecaptureSky();
+					}
+				}
 				if (!Imported)
 				{
 					Err = FString::Printf(TEXT("could not parse '%s' as %s"), *Value, *PropName);
 					return false;
 				}
 				Out->SetBoolField(TEXT("set"), true);
+				Out->SetStringField(TEXT("target"), TargetObj->GetName());
 				return true;
 			}
 			Err = FString::Printf(TEXT("actor not found: %s"), *ActorName);

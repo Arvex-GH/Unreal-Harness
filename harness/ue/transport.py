@@ -398,44 +398,46 @@ _RC_SHIMS: dict[str, str] = {
     "editor.info": "print('__HARNESS__' + json.dumps({'project': unreal.SystemLibrary.get_project_name(), 'engine': unreal.SystemLibrary.get_engine_version()}))",
     "editor.save_all": "_hr(unreal.EditorAssetLibrary.save_directory('/Game', only_if_is_dirty=False, recursive=True))",
     "asset.search": """
-q = {query!r}; cls = {cls!r}; lim = {limit}
+q = str(_args.get('query', '')); cls = str(_args.get('class', '')); lim = int(_args.get('limit', 50))
 ar = unreal.AssetRegistryHelpers.get_asset_registry()
-f = unreal.ARFilter(package_paths=['/Game'], recursive_paths=True)
+f = unreal.ARFilter(package_paths=[str(_args.get('path') or '/Game')], recursive_paths=True)
 res = []
 for a in ar.get_assets(f):
     n = str(a.asset_name)
+    c_name = str(a.asset_class_path.asset_name)
     if q and q.lower() not in n.lower(): continue
-    res.append({{'name': n, 'path': str(a.object_path), 'class': str(a.asset_class_path.asset_name)}})
+    if cls and cls.lower() not in c_name.lower(): continue
+    res.append({'name': n, 'path': str(a.object_path), 'class': c_name})
     if len(res) >= lim: break
-_hr(True, assets=res)
+_hr(True, assets=res, count=len(res))
 """,
     "bp.list_graphs": """
-bp = unreal.load_asset({bp!r})
+bp = unreal.load_asset(str(_args.get('bp', '')))
 _hr(bp is not None, graphs=[g.get_name() for g in bp.get_editor_property('function_graphs')] + [g.get_name() for g in bp.get_editor_property('ubergraph_pages')])
 """,
     "bp.compile": """
-bp = unreal.load_asset({bp!r})
+bp = unreal.load_asset(str(_args.get('bp', '')))
 unreal.BlueprintEditorLibrary.compile_blueprint(bp)
 _hr(True, success=True, status=str(bp.get_editor_property('status')))
 """,
     "bp.create": """
-p = {path!r}.split('.')[0].rstrip('/')
+p = str(_args.get('path', '')).split('.')[0].rstrip('/')
 pkg, name = p.rsplit('/', 1)
 if unreal.EditorAssetLibrary.does_asset_exist(p):
     _hr(True, path=p, existed=True, created=False)
 else:
     tools = unreal.AssetToolsHelpers.get_asset_tools()
     fac = unreal.BlueprintFactory()
-    parent_cls = getattr(unreal, {parent!r}, unreal.Actor)
+    parent_cls = getattr(unreal, str(_args.get('parent') or 'Actor'), unreal.Actor)
     fac.set_editor_property('parent_class', parent_cls)
     bp = tools.create_asset(name, pkg, unreal.Blueprint, fac)
     unreal.EditorAssetLibrary.save_asset(p)
     _hr(bp is not None, path=p, created=bp is not None, existed=False)
 """,
     "umg.create_widget": """
-p = {path!r}.split('.')[0].rstrip('/')
+p = str(_args.get('path', '')).split('.')[0].rstrip('/')
 pkg, name = p.rsplit('/', 1)
-title_text = {title_text!r}
+title_text = str(_args.get('title_text', ''))
 created = False
 if unreal.EditorAssetLibrary.does_asset_exist(p):
     wbp = unreal.load_asset(p)
@@ -479,23 +481,253 @@ if wbp is not None:
 _hr(wbp is not None, path=p, created=created, existed=not created, title_text=title_text)
 """,
     "bp.variable_add": """
-bp = unreal.load_asset({bp!r})
-t = unreal.BlueprintEditorLibrary.get_basic_type_by_name({type!r})
-ok = unreal.BlueprintEditorLibrary.add_member_variable(bp, {name!r}, t)
+bp = unreal.load_asset(str(_args.get('bp', '')))
+t = unreal.BlueprintEditorLibrary.get_basic_type_by_name(str(_args.get('type') or 'bool'))
+ok = unreal.BlueprintEditorLibrary.add_member_variable(bp, str(_args.get('name', '')), t)
 _hr(ok)
 """,
+    "editor.console": """
+w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+unreal.SystemLibrary.execute_console_command(w, _args.get('command', ''))
+_hr(True, output='executed')
+""",
+    "level.new": """
+p = (_args.get('path') or '/Game/Maps/NewLevel').split('.')[0].rstrip('/')
+add_floor = bool(_args.get('add_floor', True))
+save = bool(_args.get('save', True))
+les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+ok = les.new_level(p)
+if ok and add_floor:
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    floor = eas.spawn_actor_from_class(unreal.StaticMeshActor, unreal.Vector(0, 0, -50), unreal.Rotator(0, 0, 0))
+    if floor is not None:
+        cube_mesh = unreal.load_asset('/Engine/BasicShapes/Cube')
+        if cube_mesh is not None:
+            floor.static_mesh_component.set_static_mesh(cube_mesh)
+        floor.set_actor_scale3d(unreal.Vector(50, 50, 1))
+        floor.set_actor_label('Floor')
+ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+cam_loc = unreal.Vector(420, -180, 170)
+cam_rot = unreal.MathLibrary.find_look_at_rotation(cam_loc, unreal.Vector(0, 0, 50))
+ues.set_level_viewport_camera_info(cam_loc, cam_rot)
+if ok and save:
+    try:
+        les.save_current_level()
+    except Exception:
+        unreal.EditorAssetLibrary.save_asset(p)
+_hr(ok, path=p, floor_added=add_floor)
+""",
+    "level.camera": """
+ues = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+cur_ok, cur_loc, cur_rot = ues.get_level_viewport_camera_info()
+if not cur_ok:
+    cur_loc, cur_rot = unreal.Vector(0, 0, 150), unreal.Rotator(0, 0, 0)
+if any(k in _args for k in ('x', 'y', 'z', 'pitch', 'yaw', 'roll', 'look_x', 'look_y', 'look_z')) or _args.get('set'):
+    loc = unreal.Vector(
+        float(_args.get('x', cur_loc.x)),
+        float(_args.get('y', cur_loc.y)),
+        float(_args.get('z', cur_loc.z)),
+    )
+    if any(k in _args for k in ('look_x', 'look_y', 'look_z')):
+        target = unreal.Vector(
+            float(_args.get('look_x', 0.0)),
+            float(_args.get('look_y', 0.0)),
+            float(_args.get('look_z', 0.0)),
+        )
+        rot = unreal.MathLibrary.find_look_at_rotation(loc, target)
+    else:
+        rot = unreal.Rotator(
+            float(_args.get('roll', cur_rot.roll)),
+            float(_args.get('pitch', cur_rot.pitch)),
+            float(_args.get('yaw', cur_rot.yaw)),
+        )
+    ues.set_level_viewport_camera_info(loc, rot)
+    unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_invalidate_viewports()
+    cur_loc, cur_rot = loc, rot
+_hr(True, location=f'X={cur_loc.x:.1f} Y={cur_loc.y:.1f} Z={cur_loc.z:.1f}',
+    rotation=f'P={cur_rot.pitch:.1f} Y={cur_rot.yaw:.1f} R={cur_rot.roll:.1f}')
+""",
+    "viewport.screenshot": """
+import os
+name = (_args.get('name') or 'harness_shot').strip() or 'harness_shot'
+if name.lower().endswith('.png'):
+    name = name[:-4]
+safe = ''.join(c if (c.isalnum() or c in ('-', '_')) else '_' for c in name) or 'harness_shot'
+out_dir = os.path.abspath(os.path.join(unreal.Paths.project_saved_dir(), 'Screenshots', 'Harness'))
+os.makedirs(out_dir, exist_ok=True)
+out_path = os.path.join(out_dir, safe + '.png')
+try:
+    if os.path.exists(out_path):
+        os.remove(out_path)
+except Exception:
+    pass
+les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+try:
+    les.editor_set_viewport_realtime(True)
+    les.editor_invalidate_viewports()
+except Exception:
+    pass
+task_started = False
+try:
+    unreal.AutomationLibrary.take_high_res_screenshot(1280, 720, out_path, force_game_view=False)
+    task_started = True
+except Exception:
+    pass
+if not task_started:
+    w = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+    unreal.SystemLibrary.execute_console_command(w, f'HighResShot 1280x720 filename="{out_path}"')
+try:
+    les.editor_invalidate_viewports()
+except Exception:
+    pass
+_hr(True, path=out_path, queued=True)
+""",
     "actor.find": """
-cls = {cls!r}; lim = {limit}
+cls = str(_args.get('class', '')); lim = int(_args.get('limit', 50))
 eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
 res = []
 for a in eas.get_all_level_actors():
-    if cls and cls.lower() not in a.get_class().get_name().lower(): continue
-    res.append({{'name': a.get_name(), 'class': a.get_class().get_name(), 'path': a.get_path_name()}})
+    if cls and cls.lower() not in a.get_class().get_name().lower() and cls.lower() not in a.get_actor_label().lower(): continue
+    res.append({'name': a.get_name(), 'label': a.get_actor_label(), 'class': a.get_class().get_name(), 'path': a.get_path_name()})
     if len(res) >= lim: break
 _hr(True, actors=res)
 """,
-    "pie.start": "unreal.LevelEditorSubsystem().editor_play_simulate()\n_hr(True)",
-    "pie.stop": "unreal.LevelEditorSubsystem().editor_request_end_play()\n_hr(True)",
+    "actor.spawn": """
+cls_name = str(_args.get('class', 'Actor')).strip()
+shapes = {'cube': 'Cube', 'sphere': 'Sphere', 'cylinder': 'Cylinder', 'cone': 'Cone', 'plane': 'Plane'}
+shape_asset = shapes.get(cls_name.lower())
+eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+loc = unreal.Vector(float(_args.get('x', 0)), float(_args.get('y', 0)), float(_args.get('z', 0)))
+rot = unreal.Rotator(float(_args.get('roll', 0)), float(_args.get('pitch', 0)), float(_args.get('yaw', 0)))
+actor = None
+if shape_asset:
+    actor = eas.spawn_actor_from_class(unreal.StaticMeshActor, loc, rot)
+    if actor is not None:
+        try:
+            actor.root_component.set_editor_property('mobility', unreal.ComponentMobility.MOVABLE)
+        except Exception:
+            pass
+        m = unreal.load_asset(f'/Engine/BasicShapes/{shape_asset}')
+        if m is not None:
+            actor.static_mesh_component.set_static_mesh(m)
+elif cls_name.startswith('/'):
+    bp = unreal.load_asset(cls_name)
+    if bp is not None:
+        gen = bp.generated_class() if hasattr(bp, 'generated_class') else bp
+        actor = eas.spawn_actor_from_class(gen, loc, rot)
+else:
+    ucls = getattr(unreal, cls_name, None) or getattr(unreal, cls_name.removeprefix('A'), None)
+    if ucls is None:
+        ucls = unreal.load_class(None, f'/Script/Engine.{cls_name.removeprefix("A")}')
+    if ucls is not None:
+        actor = eas.spawn_actor_from_class(ucls, loc, rot)
+
+if actor is None:
+    _hr(False, error=f'class not found or spawn failed: {cls_name}')
+else:
+    try:
+        actor.root_component.set_editor_property('mobility', unreal.ComponentMobility.MOVABLE)
+    except Exception:
+        pass
+    if any(k in _args for k in ('scale', 'sx', 'sy', 'sz')):
+        u = float(_args.get('scale', 1.0))
+        actor.set_actor_scale3d(unreal.Vector(
+            float(_args.get('sx', u)), float(_args.get('sy', u)), float(_args.get('sz', u))
+        ))
+    if _args.get('label'):
+        actor.set_actor_label(str(_args['label']))
+    _hr(True, name=actor.get_name(), label=actor.get_actor_label(), path=actor.get_path_name())
+""",
+    "actor.set_property": """
+import re as _re
+aname = str(_args.get('actor', ''))
+prop = str(_args.get('property', ''))
+val_str = str(_args.get('value', ''))
+eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+hit = None
+for a in eas.get_all_level_actors():
+    if a.get_name() == aname or a.get_actor_label().lower() == aname.lower():
+        hit = a
+        break
+if hit is None:
+    _hr(False, error=f'actor not found: {aname}')
+else:
+    def _nums(s):
+        return [float(x) for x in _re.findall(r'[-+]?\\d*\\.?\\d+', s)]
+    pl = prop.lower()
+    if pl in ('rotation', 'actorrotation'):
+        ns = _nums(val_str)
+        p_v = float(_re.search(r'P(?:itch)?\\s*=\\s*([-+]?\\d*\\.?\\d+)', val_str, _re.I).group(1)) if _re.search(r'P(?:itch)?\\s*=', val_str, _re.I) else (ns[0] if len(ns) > 0 else 0.0)
+        y_v = float(_re.search(r'Y(?:aw)?\\s*=\\s*([-+]?\\d*\\.?\\d+)', val_str, _re.I).group(1)) if _re.search(r'Y(?:aw)?\\s*=', val_str, _re.I) else (ns[1] if len(ns) > 1 else 0.0)
+        r_v = float(_re.search(r'R(?:oll)?\\s*=\\s*([-+]?\\d*\\.?\\d+)', val_str, _re.I).group(1)) if _re.search(r'R(?:oll)?\\s*=', val_str, _re.I) else (ns[2] if len(ns) > 2 else 0.0)
+        try: hit.root_component.set_editor_property('mobility', unreal.ComponentMobility.MOVABLE)
+        except Exception: pass
+        hit.set_actor_rotation(unreal.Rotator(r_v, p_v, y_v), False)
+        _hr(True, set=True, target=hit.get_name())
+    elif pl in ('location', 'actorlocation'):
+        ns = _nums(val_str) + [0.0, 0.0, 0.0]
+        hit.set_actor_location(unreal.Vector(ns[0], ns[1], ns[2]), False, False)
+        _hr(True, set=True, target=hit.get_name())
+    elif pl in ('scale', 'actorscale3d'):
+        ns = _nums(val_str)
+        if len(ns) == 1: ns = ns * 3
+        ns = (ns + [1.0, 1.0, 1.0])[:3]
+        hit.set_actor_scale3d(unreal.Vector(ns[0], ns[1], ns[2]))
+        _hr(True, set=True, target=hit.get_name())
+    else:
+        snake = _re.sub(r'(?<!^)(?=[A-Z])', '_', prop).lower()
+        snake_no_b = snake[2:] if snake.startswith('b_') else snake
+        cands = [prop, snake, snake_no_b]
+        targets = [hit] + list(hit.get_components_by_class(unreal.ActorComponent))
+        done = False
+        last_err = ''
+        for t_obj in targets:
+            for pname in cands:
+                try:
+                    cur = t_obj.get_editor_property(pname)
+                except Exception:
+                    continue
+                try:
+                    if isinstance(cur, bool):
+                        coerced = val_str.strip().lower() in ('1', 'true', 'yes', 'on')
+                    elif isinstance(cur, int):
+                        coerced = int(float(val_str))
+                    elif isinstance(cur, float):
+                        coerced = float(val_str)
+                    elif isinstance(cur, unreal.Color):
+                        ns = _nums(val_str) + [255, 255, 255, 255]
+                        mx = max(ns[:3]) if ns else 1.0
+                        if mx <= 1.0:
+                            ns = [int(round(x * 255)) for x in ns[:4]]
+                        else:
+                            ns = [int(round(x)) for x in ns[:4]]
+                        coerced = unreal.Color(b=ns[2], g=ns[1], r=ns[0], a=ns[3] if len(ns) > 3 else 255)
+                    elif isinstance(cur, unreal.LinearColor):
+                        ns = _nums(val_str) + [1.0, 1.0, 1.0, 1.0]
+                        if max(ns[:3]) > 1.0:
+                            ns = [x / 255.0 for x in ns[:3]] + [1.0]
+                        coerced = unreal.LinearColor(ns[0], ns[1], ns[2], ns[3])
+                    elif isinstance(cur, unreal.Vector):
+                        ns = _nums(val_str) + [0.0, 0.0, 0.0]
+                        coerced = unreal.Vector(ns[0], ns[1], ns[2])
+                    else:
+                        coerced = val_str
+                    t_obj.set_editor_property(pname, coerced)
+                    if hasattr(t_obj, 'recapture_sky'):
+                        try: t_obj.recapture_sky()
+                        except Exception: pass
+                    done = True
+                    _hr(True, set=True, target=t_obj.get_name(), property=pname)
+                    break
+                except Exception as ex:
+                    last_err = str(ex)
+            if done:
+                break
+        if not done:
+            _hr(False, error=last_err or f'property {prop} not found on {aname} or its components')
+""",
+    "pie.start": "unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_play_simulate()\n_hr(True)",
+    "pie.stop": "unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).editor_request_end_play()\n_hr(True)",
 }
 
 
@@ -507,15 +739,7 @@ def _rc_shim(cmd: str, args: dict[str, Any]) -> str:
             "Install the UEHarness plugin (harness installer does this) or enable "
             "the Python Editor Script plugin for fallback coverage."
         )
-    flat = {
-        "bp": args.get("bp", ""), "cls": args.get("class", ""),
-        "name": args.get("name", ""), "type": args.get("type", "bool"),
-        "query": args.get("query", ""), "limit": int(args.get("limit", 50)),
-        "graph": args.get("graph", ""), "path": args.get("path", ""),
-        "parent": args.get("parent", "Actor"),
-        "title_text": args.get("title_text", ""),
-    }
-    return tmpl.format(**flat)
+    return f"_args = json.loads({json.dumps(args)!r})\n" + tmpl
 
 
 # ---------------------------------------------------------------------------

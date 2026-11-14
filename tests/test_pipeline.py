@@ -198,7 +198,7 @@ def test_tool_schemas_strict_json_schema():
     cfg.allow_shell = True
     cfg.allow_network = True
     schemas = registry.schemas(cfg)
-    assert len(schemas) == 49, f"expected 49 tools, got {len(schemas)}"
+    assert len(schemas) == 51, f"expected 51 tools, got {len(schemas)}"
     err = validate_tool_schemas(schemas)
     assert err is None, err
 
@@ -403,7 +403,74 @@ def test_ui_scroll_css_and_controls():
     assert ".scroll{flex:1 1 0%;min-height:0;overflow-y:auto" in html
     assert "id=\"jumpBottom\"" in html and "updateJumpButton" in html
     assert "$('#btnUpdate').onclick" in html
+    assert "resolveImageUrl" in html and "tool-shot" in html
     print("✓ web UI CSS Grid/Flex min-height:0 chat scroll + jump-to-bottom + update button")
+
+
+def test_sunset_level_cube_and_screenshot_flow():
+    import asyncio
+    from fastapi.testclient import TestClient
+    from harness.server import app, state
+    from harness.ue.transport import _PREAMBLE, _RC_SHIMS, _rc_shim
+
+    # 1) Verify every Remote Control Python shim compiles with zero syntax/format errors
+    for verb in _RC_SHIMS:
+        script = f"import unreal, json\n{_PREAMBLE}\n" + _rc_shim(
+            verb, {"path": "/Game/Maps/Sunset", "class": "Cube", "actor": "Sun",
+                   "property": "Intensity", "value": "6.0", "name": "sunset_shot"}
+        )
+        compile(script, f"<rc_shim:{verb}>", "exec")
+
+    # 2) Run the full sunset level + cube + screenshot workflow against mock bridge + FastAPI image server
+    srv, editor, cfg, ue = setup()
+    with tempfile.TemporaryDirectory() as proj_tmp:
+        uproj = Path(proj_tmp) / "SunsetProj.uproject"
+        uproj.write_text('{"FileVersion": 3, "EngineAssociation": "5.8"}', "utf-8")
+        cfg.project_path = str(uproj)
+        editor.shot_dir = str(Path(proj_tmp) / "Saved" / "Screenshots" / "Harness")
+        ctx = Ctx(cfg, ue)
+
+        async def build_sunset():
+            r_lvl = await registry.execute("level_new", {"path": "/Game/Maps/SunsetLevel"}, ctx)
+            r_atm = await registry.execute("level_spawn", {"class": "SkyAtmosphere"}, ctx)
+            r_sun = await registry.execute(
+                "level_spawn", {"class": "DirectionalLight", "pitch": -7, "yaw": 0, "label": "Sun"}, ctx
+            )
+            r_sun_p = await registry.execute(
+                "level_set_property", {"actor": "Sun", "property": "bAtmosphereSunLight", "value": "True"}, ctx
+            )
+            r_fog = await registry.execute(
+                "level_spawn", {"class": "ExponentialHeightFog", "label": "SunsetFog"}, ctx
+            )
+            r_cube = await registry.execute(
+                "level_spawn", {"class": "Cube", "x": 0, "y": 0, "z": 50, "label": "HeroCube"}, ctx
+            )
+            r_cam = await registry.execute(
+                "level_camera", {"x": 420, "y": -180, "z": 170, "look_x": 0, "look_y": 0, "look_z": 50}, ctx
+            )
+            r_shot = await registry.execute("ue_screenshot", {"name": "sunset_cube"}, ctx)
+            return r_lvl, r_atm, r_sun, r_sun_p, r_fog, r_cube, r_cam, r_shot
+
+        results = asyncio.run(build_sunset())
+        for r in results:
+            assert r.get("ok") is True, r
+        r_shot = results[-1]
+        assert r_shot["exists"] is True and r_shot["image_url"].startswith("/api/files/image?path=")
+        assert r_shot["markdown"].startswith("![sunset_cube](/api/files/image?path=")
+
+        # Verify FastAPI serves the saved screenshot and rejects files outside writable_roots
+        orig_proj = state.cfg.project_path
+        state.cfg.project_path = str(uproj)
+        try:
+            with TestClient(app) as client:
+                ok_img = client.get(r_shot["image_url"])
+                assert ok_img.status_code == 200 and ok_img.headers["content-type"].startswith("image/png")
+                blocked = client.get("/api/files/image?path=/etc/passwd")
+                assert blocked.status_code == 403
+        finally:
+            state.cfg.project_path = orig_proj
+    mock_ue.stop(srv)
+    print("✓ full sunset level + lighting/fog + Cube + ue_screenshot + /api/files/image verified")
 
 
 a: list = []

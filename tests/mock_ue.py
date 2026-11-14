@@ -279,10 +279,57 @@ class MockEditor:
 
     def cmd_actor_spawn(self, a):
         cls = a.get("class", "Actor")
-        name = f"{cls.split('/')[-1]}_{len(self.actors)}"
-        self.actors.append({"name": name, "class": cls, "path": f"/Game/Maps/Level.Level:{name}",
-                            "location": f"X={a.get('x',0)} Y={a.get('y',0)} Z={a.get('z',0)}"})
-        return True, {"name": name, "path": self.actors[-1]["path"]}, ""
+        shapes = {"cube", "sphere", "cylinder", "cone", "plane"}
+        actual_cls = "StaticMeshActor" if cls.lower() in shapes else cls
+        name = f"{actual_cls.split('/')[-1]}_{len(self.actors)}"
+        label = a.get("label") or name
+        self.actors.append({
+            "name": name,
+            "label": label,
+            "class": actual_cls,
+            "shape": cls if cls.lower() in shapes else "",
+            "path": f"/Game/Maps/Level.Level:{name}",
+            "location": f"X={a.get('x',0)} Y={a.get('y',0)} Z={a.get('z',0)}",
+            "rotation": f"P={a.get('pitch',0)} Y={a.get('yaw',0)} R={a.get('roll',0)}",
+            "props": {},
+        })
+        return True, {"name": name, "label": label, "path": self.actors[-1]["path"]}, ""
+
+    def cmd_actor_set_property(self, a):
+        target = a.get("actor", "")
+        for act in self.actors:
+            if act["name"] == target or act.get("label", "").lower() == target.lower():
+                act.setdefault("props", {})[a.get("property", "")] = a.get("value", "")
+                return True, {"set": True, "target": act["name"]}, ""
+        return False, {}, f"actor not found: {target}"
+
+    def cmd_level_new(self, a):
+        self.actors = []
+        if a.get("add_floor", True):
+            self.cmd_actor_spawn({"class": "Cube", "x": 0, "y": 0, "z": -50, "label": "Floor"})
+        return True, {"path": a.get("path", "/Game/Maps/NewLevel"),
+                      "floor_added": bool(a.get("add_floor", True))}, ""
+
+    def cmd_level_camera(self, a):
+        loc = f"X={a.get('x', 420)} Y={a.get('y', -180)} Z={a.get('z', 170)}"
+        rot = f"P={a.get('pitch', -10)} Y={a.get('yaw', 200)} R={a.get('roll', 0)}"
+        return True, {"location": loc, "rotation": rot}, ""
+
+    def cmd_viewport_screenshot(self, a):
+        import tempfile
+        from pathlib import Path
+
+        out_dir = Path(getattr(self, "shot_dir", "") or tempfile.gettempdir())
+        out_dir.mkdir(parents=True, exist_ok=True)
+        name = (a.get("name") or "harness_shot").removesuffix(".png")
+        p = out_dir / f"{name}.png"
+        # Minimal valid 1x1 PNG
+        p.write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0"
+            b"\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        return True, {"path": str(p), "width": 1280, "height": 720}, ""
 
     def cmd_pie_start(self, a):
         self.pie = True
