@@ -250,10 +250,13 @@ def apply(cfg: Config, force: bool = False) -> dict[str, Any]:
             if item.name in keep:
                 continue
             dest = ROOT / item.name
-            if dest.is_dir():
-                shutil.rmtree(dest, ignore_errors=True)
+            if item.is_dir():
+                if dest.exists():
+                    shutil.rmtree(dest, ignore_errors=True)
                 shutil.copytree(item, dest)
             else:
+                if dest.is_dir():
+                    shutil.rmtree(dest, ignore_errors=True)
                 shutil.copy2(item, dest)
 
     entry = {"at": time.time(), "from": before, "to": rel["tag"], "mode": "release",

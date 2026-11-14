@@ -99,6 +99,10 @@
   .bubble pre{background:#10141c;border:1px solid var(--line);border-radius:9px;padding:12px 14px;
               overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.5;margin:10px 0}
   .bubble pre code{background:none;padding:0}
+  .chat-img{display:block;max-width:100%;max-height:460px;border-radius:10px;border:1px solid var(--line);
+            margin:10px 0;background:#0a0c10;cursor:zoom-in}
+  .tool-shot{border-top:1px solid var(--line);padding:10px 12px;background:#0b0e14}
+  .tool-shot img{display:block;max-width:100%;max-height:420px;border-radius:8px;border:1px solid var(--line)}
 
   /* tool cards */
   .tool{border:1px solid var(--line);border-radius:10px;background:var(--panel);
@@ -512,10 +516,28 @@ async function delChat(id) {
 // ---------------------------------------------------------------------------
 // rendering
 // ---------------------------------------------------------------------------
+function resolveImageUrl(escapedUrl) {
+  const raw = escapedUrl
+    .replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim();
+  if (raw.startsWith('/api/files/image?')) return esc(raw);
+  if (/^https?:\/\//i.test(raw)) return esc(raw);
+  const cleaned = raw.replace(/^file:\/\/\/?/i, '');
+  if (/\.(png|jpe?g|webp|gif|bmp)$/i.test(cleaned)) {
+    return '/api/files/image?path=' + encodeURIComponent(cleaned);
+  }
+  return '';
+}
+
 function mdLite(text) {
   let t = esc(text);
   t = t.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) =>
     `<pre><code>${code.replace(/\n$/, '')}</code></pre>`);
+  t = t.replace(/!\[([^\]]*)\]\(([^)\n]+)\)/g, (full, alt, url) => {
+    const src = resolveImageUrl(url);
+    if (!src) return full;
+    return `<a href="${src}" target="_blank" rel="noopener"><img class="chat-img" src="${src}" alt="${alt}" loading="lazy" onload="scrollBottom()"></a>`;
+  });
   t = t.replace(/`([^`\n]+)`/g, '<code>$1</code>');
   t = t.replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
   return t;
@@ -540,6 +562,9 @@ function toolCard(name, args, { pending = false, result = null, duration = null,
   const status = pending ? '<div class="spin"></div>'
     : (result && (result.ok === false || result.error)) ? '<div class="cross">✕</div>'
     : '<div class="tick">✓</div>';
+  const shotHtml = (result && result.image_url)
+    ? `<div class="tool-shot"><a href="${esc(result.image_url)}" target="_blank" rel="noopener"><img src="${esc(result.image_url)}" alt="${esc(name)}" loading="lazy" onload="scrollBottom()"></a></div>`
+    : '';
   el.innerHTML = `
     <div class="tool-head">
       ${status}
@@ -547,6 +572,7 @@ function toolCard(name, args, { pending = false, result = null, duration = null,
       <span class="tool-sum">${esc(denied ? 'denied by user' : toolSummary(name, args))}</span>
       <span class="tool-dur">${duration != null ? duration + 'ms' : ''}</span>
     </div>
+    ${shotHtml}
     <div class="tool-body">
       <div class="label">arguments</div>
       <div class="block"><pre>${esc(JSON.stringify(args, null, 2))}</pre></div>

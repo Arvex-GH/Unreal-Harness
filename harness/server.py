@@ -10,7 +10,7 @@ from typing import Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -372,6 +372,38 @@ async def ue_browse(body: dict):
 
 
 # --------------------------------------------------------------------- system
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
+@app.get("/api/files/image")
+async def serve_project_image(path: str):
+    if not path:
+        raise HTTPException(400, "missing path")
+    cand = Path(path).expanduser()
+    if not cand.is_absolute() and state.cfg.project_dir:
+        cand = state.cfg.project_dir / cand
+    try:
+        resolved = cand.resolve()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"invalid path: {e}") from e
+
+    if resolved.suffix.lower() not in _IMAGE_EXTS:
+        raise HTTPException(403, "only image files may be served")
+    allowed = False
+    for root in state.cfg.writable_roots:
+        try:
+            resolved.relative_to(root.resolve())
+            allowed = True
+            break
+        except ValueError:
+            continue
+    if not allowed:
+        raise HTTPException(403, "path is outside configured project/workspace roots")
+    if not resolved.is_file():
+        raise HTTPException(404, "image file not found")
+    return FileResponse(str(resolved), headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/system/paths")
 async def system_paths():
     return {
