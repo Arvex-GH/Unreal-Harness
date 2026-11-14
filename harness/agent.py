@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
@@ -104,58 +105,123 @@ class Agent:
         self.ctx = ctx
 
     # ------------------------------------------------------------- history
-    def _history(self) -> list[dict]:
-        msgs = self.ctx.store.messages(self.ctx.chat_id)
-        clean = []
-        for m in msgs:
-            m = {k: v for k, v in m.items() if not k.startswith("_")}
-            if m["role"] == "tool" and not m.get("tool_call_id"):
+    def _history(self, use_native_tools: bool = True) -> list[dict]:
+        raw_msgs = [
+            {k: v for k, v in m.items() if not k.startswith("_")}
+            for m in self.ctx.store.messages(self.ctx.chat_id)
+        ]
+
+        # Collect tool_call_ids that actually have a corresponding tool response.
+        answered_ids = {
+            m["tool_call_id"]
+            for m in raw_msgs
+            if m.get("role") == "tool" and m.get("tool_call_id")
+        }
+
+        staged: list[dict] = []
+        for m in raw_msgs:
+            role = m.get("role")
+            if role == "tool":
+                tcid = m.get("tool_call_id")
+                if not tcid:
+                    continue
+                if use_native_tools:
+                    staged.append(m)
+                else:
+                    label = m.get("name") or tcid
+                    staged.append({
+                        "role": "user",
+                        "content": f"TOOL RESULT ({label}): {m.get('content') or ''}",
+                    })
                 continue
-            # an assistant message with tool_calls must be followed by tool results;
-            # if the turn was interrupted mid-way, drop the orphaned call record
-            if m["role"] == "assistant" and m.get("tool_calls") and not m["content"]:
-                m = {**m, "content": ""}
-            clean.append(m)
+
+            if role == "assistant" and m.get("tool_calls"):
+                if use_native_tools:
+                    valid_calls = [
+                        tc for tc in m["tool_calls"]
+                        if tc.get("id") in answered_ids
+                    ]
+                    if valid_calls:
+                        staged.append({
+                            **m,
+                            "content": m.get("content") or "",
+                            "tool_calls": valid_calls,
+                        })
+                    elif (m.get("content") or "").strip():
+                        clean_m = {k: v for k, v in m.items() if k != "tool_calls"}
+                        staged.append(clean_m)
+                else:
+                    content = (m.get("content") or "").strip()
+                    if content:
+                        staged.append({"role": "assistant", "content": content})
+                continue
+
+            staged.append(m)
+
+        # Merge consecutive `user` messages so strict alternating Jinja templates
+        # in LM Studio never fail after an interrupted or errored turn.
+        clean: list[dict] = []
+        for m in staged:
+            if clean and m.get("role") == "user" and clean[-1].get("role") == "user":
+                prev = clean[-1].get("content") or ""
+                cur = m.get("content") or ""
+                clean[-1] = {**clean[-1], "content": f"{prev}\n\n{cur}".strip()}
+            else:
+                clean.append(m)
         return clean
 
-    def _system_messages(self) -> list[dict]:
+    def _system_messages(self, use_native_tools: bool = True) -> list[dict]:
         ue = self.ctx.ue
         st = ue.status()
         cfg = self.ctx.cfg
-        tools_note = "" if cfg.native_tool_calls else TEXT_PROTOCOL_ADDENDUM
+        tools_note = "" if use_native_tools else TEXT_PROTOCOL_ADDENDUM
 
         project = cfg.project_file
         tool_count = len(registry.schemas(cfg))
+        catalog_section = (
+            ""
+            if use_native_tools
+            else f"\n# Tool catalogue\n{registry.catalog_text(cfg)}\n"
+        )
         env = f"""# Environment
 - Transport: {st['transport']} ({'editor connected' if st['editor_connected'] else 'EDITOR NOT CONNECTED - use file tools or ue_launch_editor'})
 - Project: {project or 'not configured'}
 - Engine: {cfg.engine_path or 'not configured'}
 - Tools available: {tool_count}
 - Approval mode: {cfg.approval_mode}
-
-# Tool catalogue
-{registry.catalog_text(cfg)}
-"""
+{catalog_section}"""
         return [{"role": "system", "content": SYSTEM_PROMPT + tools_note + "\n" + env}]
 
     # ------------------------------------------------------------- running
     async def run(self) -> AsyncIterator[dict[str, Any]]:
         """Yields events for the UI and resolves the user's pending message."""
-        emit = self.ctx.emit
         cfg = self.ctx.cfg
+        try:
+            model = await self.ctx.llm.resolve_model()
+        except LLMError as e:
+            yield {"type": "error", "error": str(e)}
+            return
 
-        for step in range(cfg.max_steps):
+        step = 0
+        retried_without_tools = False
+
+        while step < cfg.max_steps:
             self.ctx.step = step
             if self.ctx.cancel.is_set():
                 yield {"type": "cancelled"}
                 return
 
-            messages = self._system_messages() + prune(self._history(), cfg.context_budget_tokens)
-            schemas = registry.schemas(cfg) if cfg.native_tool_calls else None
+            use_native = self.ctx.llm.supports_native_tools(model)
+            messages = (
+                self._system_messages(use_native)
+                + prune(self._history(use_native), cfg.context_budget_tokens)
+            )
+            schemas = registry.schemas(cfg) if use_native else None
 
             text_parts: list[str] = []
             calls: list[dict] = []
             usage = None
+            reasoning = ""
             try:
                 async for ev in self.ctx.llm.stream_chat(messages, schemas):
                     if self.ctx.cancel.is_set():
@@ -169,12 +235,13 @@ class Agent:
                     elif ev["type"] == "usage":
                         usage = ev["usage"]
                     elif ev["type"] == "done":
-                        pass
+                        reasoning = ev.get("reasoning") or ""
             except LLMError as e:
-                if str(e).startswith("TOOLS_UNSUPPORTED::"):
+                if str(e).startswith("TOOLS_UNSUPPORTED::") and not retried_without_tools:
+                    retried_without_tools = True
+                    self.ctx.llm.mark_tools_unsupported(model)
                     yield {"type": "notice",
-                           "text": "Model rejected native tools - switching to the text tool protocol."}
-                    cfg.save()
+                           "text": "Model rejected native tools — switched to text tool protocol."}
                     continue
                 yield {"type": "error", "error": str(e)}
                 return
@@ -182,12 +249,34 @@ class Agent:
             text = "".join(text_parts)
 
             # Fallback protocol parsing
-            if not calls and not cfg.native_tool_calls:
+            if not calls and not use_native:
                 calls = parse_text_tool_calls(text)
 
             if not calls:
-                if text.strip():
-                    self.ctx.store.add_message(self.ctx.chat_id, "assistant", text)
+                if not text.strip():
+                    if use_native and step == 0 and not retried_without_tools:
+                        retried_without_tools = True
+                        self.ctx.llm.mark_tools_unsupported(model)
+                        yield {"type": "notice",
+                               "text": "Empty response with native tools — retrying with text protocol."}
+                        continue
+                    if reasoning.strip():
+                        yield {
+                            "type": "error",
+                            "error": (
+                                "Model ran out of max_tokens while thinking before writing a reply. "
+                                "Increase Max tokens in Settings."
+                            ),
+                        }
+                        return
+                    fallback_msg = (
+                        "(Model returned an empty response. Check Context Length / Max tokens "
+                        "in LM Studio, or try another loaded model in Settings.)"
+                    )
+                    yield {"type": "final", "text": fallback_msg, "usage": usage, "steps": step + 1}
+                    return
+
+                self.ctx.store.add_message(self.ctx.chat_id, "assistant", text)
                 yield {"type": "final", "text": text, "usage": usage, "steps": step + 1}
                 return
 
@@ -195,7 +284,7 @@ class Agent:
             # part of the message; in text-protocol mode the fenced blocks are
             # already inside `text`, so we store them as plain content.
             self.ctx.store.add_message(self.ctx.chat_id, "assistant", text,
-                                       tool_calls=calls if cfg.native_tool_calls else None)
+                                       tool_calls=calls if use_native else None)
             if text.strip():
                 yield {"type": "assistant_text", "text": text}
 
@@ -213,7 +302,7 @@ class Agent:
                            "duration_ms": 0}
                     bad = json.dumps({"ok": False, "error": "arguments were not valid JSON",
                                       "hint": "emit a single valid JSON object in args"})
-                    if cfg.native_tool_calls:
+                    if use_native:
                         self.ctx.store.add_message(self.ctx.chat_id, "tool", bad,
                                                    tool_call_id=call["id"], name=name)
                     else:
@@ -232,7 +321,7 @@ class Agent:
                         res = {"ok": False, "error": "user denied this action"}
                         yield {"type": "tool", "name": name, "args": args, "result": res,
                                "duration_ms": 0, "denied": True}
-                        if cfg.native_tool_calls:
+                        if use_native:
                             self.ctx.store.add_message(self.ctx.chat_id, "tool",
                                                        json.dumps(res),
                                                        tool_call_id=call["id"], name=name)
@@ -248,7 +337,7 @@ class Agent:
                 payload = json.dumps(res, default=str)
                 if len(payload) > 24000:
                     payload = payload[:24000] + '... [truncated]'
-                if cfg.native_tool_calls:
+                if use_native:
                     self.ctx.store.add_message(self.ctx.chat_id, "tool", payload,
                                                tool_call_id=call["id"], name=name)
                 else:
@@ -261,8 +350,9 @@ class Agent:
                 yield {"type": "tool", "name": name, "args": args,
                        "result": res, "duration_ms": dur}
 
+            step += 1
             if not cfg.autopilot:
-                yield {"type": "paused", "steps": step + 1}
+                yield {"type": "paused", "steps": step}
                 return
 
         yield {"type": "limit", "steps": cfg.max_steps}
@@ -273,15 +363,20 @@ class Agent:
 # ---------------------------------------------------------------------------
 async def suggest_title(llm: LLMClient, first_message: str) -> str:
     text = first_message.strip().replace("\n", " ")[:300]
+    if len(text.split()) <= 5:
+        return text[:60] or "New chat"
     try:
         out = []
         async for ev in llm.stream_chat(
                 [{"role": "system", "content": "Reply with a 3-6 word title only, no quotes."},
-                 {"role": "user", "content": text}], tools=None, max_tokens=24,
+                 {"role": "user", "content": text}], tools=None, max_tokens=32,
                 temperature=0.2):
             if ev["type"] == "text":
                 out.append(ev["text"])
-        title = "".join(out).strip().strip('"').strip()
+        raw = "".join(out)
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.S)
+        raw = re.sub(r"```.*?```", "", raw, flags=re.S)
+        title = raw.strip().strip('"').strip("'").splitlines()[0].strip() if raw.strip() else ""
         return title[:60] or text[:40]
     except Exception:
         return text[:40] or "New chat"

@@ -2,7 +2,7 @@
 
 It plays a tiny scripted agent: turns user intent into tool calls, so you can
 watch the whole pipeline (SSE -> tools -> engine) without an LLM.
-Not a real model: just a deterministic OpenAI-compatible stub.
+Also enforces strict llama.cpp-style JSON Schema validation on `tools`.
 """
 from __future__ import annotations
 
@@ -11,6 +11,39 @@ import re
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VALID_JSON_TYPES = {"string", "number", "integer", "boolean", "array", "object", "null"}
+
+
+def validate_tool_schemas(tools: list[dict]) -> str | None:
+    """Validate OpenAI tool definitions using llama.cpp json-schema-to-grammar rules."""
+    for idx, t in enumerate(tools):
+        fn = t.get("function") or {}
+        name = fn.get("name") or f"tool[{idx}]"
+        params = fn.get("parameters")
+        if not isinstance(params, dict) or params.get("type") != "object":
+            return f"JSON schema error in {name}: parameters must be type=object"
+        props = params.get("properties")
+        if not isinstance(props, dict):
+            return f"JSON schema error in {name}: properties must be an object"
+        req = params.get("required", [])
+        if not isinstance(req, list) or any(k not in props for k in req):
+            return f"JSON schema error in {name}: required must be a list of defined properties"
+        for prop_name, spec in props.items():
+            if not isinstance(spec, dict):
+                return f"JSON schema error at #/properties/{prop_name}: must be an object"
+            ptype = spec.get("type")
+            if ptype not in VALID_JSON_TYPES:
+                return f"JSON schema error at #/properties/{prop_name}: invalid type {ptype!r}"
+            if "enum" in spec:
+                enum_val = spec["enum"]
+                if not isinstance(enum_val, list) or len(enum_val) == 0:
+                    return f"JSON schema error at #/properties/{prop_name}: enum must be a non-empty array"
+            if ptype == "array":
+                items = spec.get("items")
+                if not isinstance(items, dict) or items.get("type") not in VALID_JSON_TYPES:
+                    return f"JSON schema error at #/properties/{prop_name}: array items must specify a valid type"
+    return None
 
 
 def _sse(obj) -> bytes:
@@ -36,7 +69,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.endswith("/models"):
-            body = json.dumps({"data": [{"id": "mock-agent", "object": "model"}]}).encode()
+            body = json.dumps({
+                "data": [
+                    {"id": "text-embedding-nomic-embed-text-v1.5", "object": "model"},
+                    {"id": "mock-agent", "object": "model"},
+                    {"id": "no-tools-sse-500-model", "object": "model"},
+                ]
+            }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -49,7 +88,34 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         req = json.loads(self.rfile.read(n) or b"{}")
         messages = req.get("messages", [])
-        has_tools = bool(req.get("tools"))
+        tools = req.get("tools") or []
+        has_tools = bool(tools)
+        model = req.get("model") or "mock-agent"
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        # Reproduce LM Studio's mid-stream llama.cpp 500 error if any tool schema is malformed
+        # or if the selected model rejects native tools after SSE headers are sent.
+        if has_tools:
+            schema_err = validate_tool_schemas(tools)
+            if schema_err:
+                self.wfile.write(_sse({
+                    "error": {"code": 500, "message": schema_err, "type": "server_error"}
+                }))
+                return
+            if model == "no-tools-sse-500-model":
+                self.wfile.write(_sse({
+                    "error": {
+                        "code": 500,
+                        "message": "Jinja template error: model does not support tool calling",
+                        "type": "server_error",
+                    }
+                }))
+                return
 
         # find the last user message and how many tool results we've had
         last_user = ""
@@ -59,18 +125,16 @@ class Handler(BaseHTTPRequestHandler):
                 last_user = m.get("content", "")
             if m.get("role") == "tool":
                 tool_results.append(m.get("content", ""))
-            # text-protocol mode feeds results back as user messages, exactly like
-            # a real model would read them from its transcript
             if m.get("role") == "user" and (m.get("content") or "").startswith("TOOL RESULT ("):
                 tool_results.append(m.get("content", ""))
         done = len(tool_results)
-        text = last_user.lower()
+        text = last_user.strip().lower()
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
+        if text in ("hi", "hello", "hey"):
+            self._say("Hi! Ready to help with your Unreal Engine 5 project.")
+            self.wfile.write(_sse(_chunk(finish="stop")))
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
 
         plan = self._plan(text, done)
         if plan is None:

@@ -147,9 +147,17 @@ def req(params: dict[str, Any], *names: str) -> dict[str, Any]:
 
 
 def S(desc: str, enum: list[str] | None = None, default: Any = None) -> dict[str, Any]:
+    if isinstance(enum, str):
+        # Guard against positional S("desc", "default_value") calls so `enum`
+        # is never serialized as a string instead of a JSON Schema array.
+        if default is None:
+            default = enum
+        enum = None
     d: dict[str, Any] = {"type": "string", "description": desc}
-    if enum:
-        d["enum"] = enum
+    if enum is not None:
+        if not isinstance(enum, (list, tuple)) or len(enum) == 0:
+            raise ValueError(f"enum must be a non-empty list of strings, got {enum!r}")
+        d["enum"] = [str(x) for x in enum]
     if default is not None:
         d["default"] = default
     return d
@@ -166,8 +174,9 @@ def B(desc: str, default: bool = False) -> dict[str, Any]:
     return {"type": "boolean", "description": desc, "default": default}
 
 
-def A(desc: str, item_type: str = "string") -> dict[str, Any]:
-    return {"type": "array", "description": desc, "items": {"type": item_type}}
+def A(desc: str, item_type: str | dict[str, Any] = "string") -> dict[str, Any]:
+    items = item_type if isinstance(item_type, dict) else {"type": item_type}
+    return {"type": "array", "description": desc, "items": items}
 
 
 def O(desc: str) -> dict[str, Any]:

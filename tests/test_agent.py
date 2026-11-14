@@ -134,9 +134,49 @@ def test_stop_between_steps():
         mock_ue.stop(srv)
 
 
+def test_greeting_auto_model_and_sse_500_fallback():
+    """Reproduces saying 'hi' against LM Studio with:
+    1) auto model selection skipping embedding models,
+    2) full 49-tool schema validation on the stream, and
+    3) a model that emits a mid-stream SSE 500 on native tools -> auto fallback -> reply.
+    """
+    srv, editor, lm, cfg, store, ctx = make_env(True)
+    try:
+        # 1) Auto model selection must skip text-embedding-nomic-embed-text-v1.5
+        cfg.model = ""
+        resolved = asyncio.run(ctx.llm.resolve_model())
+        assert resolved == "mock-agent", f"unexpected auto model: {resolved}"
+
+        # Saying "hi" with all tools enabled returns a real greeting
+        store.add_message(ctx.chat_id, "user", "hi")
+        events = asyncio.run(drain(ctx))
+        finals = [e for e in events if e["type"] == "final"]
+        assert finals and "Hi!" in finals[0]["text"], events
+
+        # 2) Model that emits mid-stream SSE 500 when tools are sent falls back & still replies
+        cfg.model = "no-tools-sse-500-model"
+        chat2 = store.create_chat("fallback-test")["id"]
+        ctx.chat_id = chat2
+        store.add_message(chat2, "user", "hi")
+        events2 = asyncio.run(drain(ctx))
+        notices = [e for e in events2 if e["type"] == "notice"]
+        finals2 = [e for e in events2 if e["type"] == "final"]
+        assert notices, f"expected fallback notice, got {events2}"
+        assert finals2 and "Hi!" in finals2[0]["text"], events2
+        print("✓ 'hi' greeting + embedding skip + mid-stream SSE 500 fallback all work")
+    finally:
+        lm.stop()
+        mock_ue.stop(srv)
+
+
 if __name__ == "__main__":
     failures = 0
-    for fn in (test_native_tool_calling, test_text_protocol_fallback, test_stop_between_steps):
+    for fn in (
+        test_native_tool_calling,
+        test_text_protocol_fallback,
+        test_stop_between_steps,
+        test_greeting_auto_model_and_sse_500_fallback,
+    ):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
