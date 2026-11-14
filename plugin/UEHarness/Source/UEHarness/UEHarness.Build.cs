@@ -38,7 +38,9 @@ public class UEHarness : ModuleRules
 			"LevelEditor",
 			"MaterialEditor",
 			"RenderCore",
-			"Projects"
+			"Projects",
+			"UMG",
+			"UMGEditor"
 		});
 
 		// Python bridge is optional: if the PythonScriptPlugin is enabled we drive it,

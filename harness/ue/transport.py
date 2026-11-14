@@ -144,11 +144,15 @@ class BridgeTransport:
         return ok
 
 
+class RemotePythonDisabledError(TransportError):
+    """Raised when Remote Control is reachable but bEnableRemotePythonExecution is false in UE."""
+
+
 # ---------------------------------------------------------------------------
 # 2. Remote Control API + Python editor scripting
 # ---------------------------------------------------------------------------
 class RemoteControlTransport:
-    """Stock-plugin transport. Works with zero installation in the project."""
+    """Stock-plugin transport. Works with zero C++ compilation in the project."""
 
     name = "rc"
 
@@ -171,11 +175,165 @@ class RemoteControlTransport:
     def _put(self, path: str, body: dict[str, Any]) -> Any:
         r = self._client.put(f"{self.base}{path}", json=body)
         if r.status_code >= 400:
-            raise TransportError(f"RC {r.status_code}: {r.text[:300]}")
+            txt = r.text[:400]
+            if "Default__PythonScriptLibrary cannot be accessed remotely" in txt:
+                auto_note = self._auto_enable_remote_python()
+                raise RemotePythonDisabledError(
+                    "Unreal Remote Control blocked Default__PythonScriptLibrary because "
+                    "'bEnableRemotePythonExecution' was disabled in the running editor. "
+                    f"{auto_note}"
+                )
+            raise TransportError(f"RC {r.status_code}: {txt}")
         try:
             return r.json()
         except Exception:
             return {}
+
+    def _auto_enable_remote_python(self) -> str:
+        try:
+            from .project import Installer
+
+            info = Installer(self.cfg).configure_remote_control()
+            if info.get("configured"):
+                return (
+                    f"Unreal Harness automatically enabled bEnableRemotePythonExecution=True in "
+                    f"{info.get('remote_control_ini')}. Restart Unreal Editor once to activate it "
+                    "(or in Unreal Editor open Edit > Project Settings > Plugins > Remote Control, "
+                    "temporarily tick 'Restrict Server Access', tick 'Enable Remote Python Execution', "
+                    "then untick 'Restrict Server Access')."
+                )
+        except Exception:
+            pass
+        return (
+            "Enable 'bEnableRemotePythonExecution=True' under "
+            "[/Script/RemoteControlCommon.RemoteControlSettings] in Config/DefaultRemoteControl.ini "
+            "and restart Unreal Editor."
+        )
+
+    def call_object(
+        self,
+        object_path: str,
+        function_name: str,
+        parameters: dict[str, Any] | None = None,
+        transaction: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "objectPath": object_path,
+            "functionName": function_name,
+            "generateTransaction": transaction,
+        }
+        if parameters:
+            body["parameters"] = parameters
+        data = self._put("/remote/object/call", body)
+        return data if isinstance(data, dict) else {}
+
+    def set_property(self, object_path: str, property_name: str, value: Any) -> None:
+        self._put(
+            "/remote/object/property",
+            {
+                "objectPath": object_path,
+                "propertyName": property_name,
+                "propertyValue": {property_name: value},
+                "access": "WRITE_ACCESS",
+            },
+        )
+
+    def create_widget_blueprint(self, path: str, title_text: str = "") -> dict[str, Any]:
+        """Direct Remote Control WidgetBlueprint creation without Default__PythonScriptLibrary."""
+        pkg_name = path.split(".")[0].rstrip("/")
+        if not pkg_name.startswith("/"):
+            pkg_name = "/" + pkg_name
+        parts = pkg_name.rsplit("/", 1)
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise TransportError(f"invalid widget path: {path}")
+        pkg_dir, asset_name = parts[0], parts[1]
+        obj_path = f"{pkg_name}.{asset_name}"
+
+        exists_res = self.call_object(
+            "/Script/EditorScriptingUtilities.Default__EditorAssetLibrary",
+            "DoesAssetExist",
+            {"AssetPath": pkg_name},
+        )
+        if exists_res.get("ReturnValue") is True:
+            return {"ok": True, "existed": True, "created": False, "path": pkg_name}
+
+        umg_settings = "/Script/UMGEditor.Default__UMGEditorProjectSettings"
+        set_root_ok = False
+        try:
+            self.set_property(umg_settings, "DefaultRootWidget", "/Script/UMG.CanvasPanel")
+            set_root_ok = True
+        except Exception:
+            pass
+
+        try:
+            tools_path = "/Engine/Transient.AssetToolsImpl_0"
+            try:
+                at_res = self.call_object(
+                    "/Script/AssetTools.Default__AssetToolsHelpers", "GetAssetTools"
+                )
+                rv = at_res.get("ReturnValue")
+                if isinstance(rv, str) and rv.startswith("/"):
+                    tools_path = rv
+            except Exception:
+                pass
+
+            self.call_object(
+                tools_path,
+                "CreateAsset",
+                {
+                    "AssetName": asset_name,
+                    "PackagePath": pkg_dir,
+                    "AssetClass": "/Script/UMGEditor.WidgetBlueprint",
+                    "Factory": "/Script/UMGEditor.Default__WidgetBlueprintFactory",
+                },
+                transaction=True,
+            )
+        finally:
+            if set_root_ok:
+                try:
+                    self.set_property(umg_settings, "DefaultRootWidget", "None")
+                except Exception:
+                    pass
+
+        try:
+            self.call_object(
+                "/Script/BlueprintEditorLibrary.Default__BlueprintEditorLibrary",
+                "CompileBlueprint",
+                {"Blueprint": obj_path},
+            )
+        except Exception:
+            pass
+
+        self.call_object(
+            "/Script/EditorScriptingUtilities.Default__EditorAssetLibrary",
+            "SaveAsset",
+            {"AssetToSave": pkg_name, "bOnlyIfIsDirty": False},
+        )
+
+        verify = self.call_object(
+            "/Script/EditorScriptingUtilities.Default__EditorAssetLibrary",
+            "DoesAssetExist",
+            {"AssetPath": pkg_name},
+        )
+        if verify.get("ReturnValue") is not True:
+            raise TransportError(f"failed to create WidgetBlueprint at {pkg_name} via Remote Control")
+
+        out: dict[str, Any] = {
+            "ok": True,
+            "created": True,
+            "existed": False,
+            "path": pkg_name,
+            "root_widget": "CanvasPanel",
+            "transport": "rc_direct",
+        }
+        if title_text:
+            note = self._auto_enable_remote_python()
+            out["note"] = (
+                f"Created {pkg_name} with CanvasPanel root via Remote Control. "
+                f"To populate child TextBlock ('{title_text}') without the C++ bridge, "
+                f"Remote Python has been enabled in DefaultRemoteControl.ini — {note}"
+            )
+        return out
 
     def python(self, code: str) -> str:
         """Run Python inside the editor via the Python Editor Script plugin.
@@ -199,11 +357,32 @@ class RemoteControlTransport:
         return out
 
     def call(self, cmd: str, args: dict[str, Any] | None = None, flags: int = 0):
-        """Adapts the native verb surface onto python calls (slower, but portable)."""
+        """Adapts the native verb surface onto python/RC calls (slower, but portable)."""
+        args = args or {}
         try:
-            code = _rc_shim(cmd, args or {})
+            code = _rc_shim(cmd, args)
             out = self.python(f"import unreal, json\n{_PREAMBLE}\n{code}")
+            for line in reversed(out.splitlines()):
+                if "__HARNESS__" in line:
+                    payload_str = line.split("__HARNESS__", 1)[1].strip()
+                    try:
+                        parsed = json.loads(payload_str)
+                        if isinstance(parsed, dict):
+                            ok_flag = bool(parsed.pop("_ok", True))
+                            return ok_flag, parsed, (parsed.get("error") if not ok_flag else None)
+                    except Exception:
+                        pass
             return True, {"output": out}, None
+        except RemotePythonDisabledError as e:
+            if cmd == "umg.create_widget":
+                try:
+                    res = self.create_widget_blueprint(
+                        args.get("path", ""), args.get("title_text", "")
+                    )
+                    return True, res, None
+                except TransportError:
+                    pass
+            return False, None, str(e)
         except TransportError as e:
             return False, None, str(e)
 
@@ -237,7 +416,67 @@ _hr(bp is not None, graphs=[g.get_name() for g in bp.get_editor_property('functi
     "bp.compile": """
 bp = unreal.load_asset({bp!r})
 unreal.BlueprintEditorLibrary.compile_blueprint(bp)
-_hr(True, status=str(bp.get_editor_property('status')))
+_hr(True, success=True, status=str(bp.get_editor_property('status')))
+""",
+    "bp.create": """
+p = {path!r}.split('.')[0].rstrip('/')
+pkg, name = p.rsplit('/', 1)
+if unreal.EditorAssetLibrary.does_asset_exist(p):
+    _hr(True, path=p, existed=True, created=False)
+else:
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+    fac = unreal.BlueprintFactory()
+    parent_cls = getattr(unreal, {parent!r}, unreal.Actor)
+    fac.set_editor_property('parent_class', parent_cls)
+    bp = tools.create_asset(name, pkg, unreal.Blueprint, fac)
+    unreal.EditorAssetLibrary.save_asset(p)
+    _hr(bp is not None, path=p, created=bp is not None, existed=False)
+""",
+    "umg.create_widget": """
+p = {path!r}.split('.')[0].rstrip('/')
+pkg, name = p.rsplit('/', 1)
+title_text = {title_text!r}
+created = False
+if unreal.EditorAssetLibrary.does_asset_exist(p):
+    wbp = unreal.load_asset(p)
+else:
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+    umg_cfg = unreal.get_default_object(unreal.UMGEditorProjectSettings)
+    old_root = umg_cfg.get_editor_property('default_root_widget')
+    umg_cfg.set_editor_property('default_root_widget', unreal.CanvasPanel)
+    try:
+        fac = unreal.WidgetBlueprintFactory()
+        fac.set_editor_property('parent_class', unreal.UserWidget)
+        wbp = tools.create_asset(name, pkg, unreal.WidgetBlueprint, fac)
+        created = wbp is not None
+    finally:
+        umg_cfg.set_editor_property('default_root_widget', old_root)
+
+if wbp is not None and title_text:
+    wt = unreal.find_object(wbp, 'WidgetTree')
+    if wt is not None:
+        canvas = unreal.find_object(wt, 'CanvasPanel_0') or unreal.find_object(wt, 'RootCanvas')
+        if canvas is not None:
+            txt = unreal.find_object(wt, 'TitleText')
+            if txt is None:
+                txt = unreal.new_object(unreal.TextBlock, outer=wt, name='TitleText')
+                slot = canvas.add_child_to_canvas(txt)
+                if slot is not None:
+                    try:
+                        slot.set_auto_size(True)
+                        slot.set_alignment(unreal.Vector2D(0.5, 0.5))
+                    except Exception:
+                        pass
+            if txt is not None:
+                txt.set_text(title_text)
+
+if wbp is not None:
+    try:
+        unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
+    except Exception:
+        pass
+    unreal.EditorAssetLibrary.save_asset(p)
+_hr(wbp is not None, path=p, created=created, existed=not created, title_text=title_text)
 """,
     "bp.variable_add": """
 bp = unreal.load_asset({bp!r})
@@ -272,7 +511,9 @@ def _rc_shim(cmd: str, args: dict[str, Any]) -> str:
         "bp": args.get("bp", ""), "cls": args.get("class", ""),
         "name": args.get("name", ""), "type": args.get("type", "bool"),
         "query": args.get("query", ""), "limit": int(args.get("limit", 50)),
-        "graph": args.get("graph", ""),
+        "graph": args.get("graph", ""), "path": args.get("path", ""),
+        "parent": args.get("parent", "Actor"),
+        "title_text": args.get("title_text", ""),
     }
     return tmpl.format(**flat)
 

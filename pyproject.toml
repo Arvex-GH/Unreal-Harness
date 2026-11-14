@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unreal-harness"
-version = "1.0.1"
+version = "1.0.2"
 description = "Local-first AI agent harness with deep, full-control access to Unreal Engine 5"
 readme = "README.md"
 requires-python = ">=3.10"

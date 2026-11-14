@@ -6,8 +6,11 @@
 #include "Async/Async.h"
 #include "Common/TcpSocketBuilder.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/RunnableThread.h"
 #include "Interfaces/IPv4/IPv4Address.h"
 #include "Interfaces/IPv4/IPv4Endpoint.h"
+#include "Misc/CoreMiscGlobals.h"
+#include "Misc/EngineVersionComparison.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "SocketSubsystem.h"
@@ -84,7 +87,11 @@ private:
 				const int32 LineLen = NewlineIdx;
 				FUTF8ToTCHAR Converted(reinterpret_cast<const ANSICHAR*>(Buffer.GetData()), LineLen);
 				FString Line(Converted.Length(), Converted.Get());
+#if UE_VERSION_OLDER_THAN(5, 5, 0)
+				Buffer.RemoveAt(0, LineLen + 1, false);
+#else
 				Buffer.RemoveAt(0, LineLen + 1, EAllowShrinking::No);
+#endif
 
 				Line.TrimStartAndEndInline();
 				if (Line.IsEmpty())
@@ -151,44 +158,29 @@ bool FUEHarnessServer::Start(int32 Port)
 	FIPv4Address::Parse(TEXT("127.0.0.1"), Address);
 	const FIPv4Endpoint Endpoint(Address, static_cast<uint16>(Port));
 
-	// CreateSocket + Bind + Listen by hand so we own the lifetime explicitly.
-	Listener = Sockets->CreateSocket(TEXT("UEHarnessListener"), TEXT("UEHarness"), true);
+	Listener = FTcpSocketBuilder(TEXT("UEHarnessListener"))
+		.AsReusable()
+		.BoundToEndpoint(Endpoint)
+		.Listening(8);
 	if (!Listener)
 	{
-		return false;
-	}
-	Listener->SetReuseAddr(true);
-
-	bool bBound = false;
-	if (Port != 0)
-	{
-		bBound = Listener->Bind(Endpoint.ToInternetAddr().Get());
-	}
-	else
-	{
-		const FIPv4Endpoint Any(Address, 0);
-		bBound = Listener->Bind(Any.ToInternetAddr().Get());
-	}
-
-	if (!bBound)
-	{
 		UE_LOG(LogHarnessSrv, Warning, TEXT("Failed to bind port %d"), Port);
-		Sockets->DestroySocket(Listener);
-		Listener = nullptr;
-		return false;
-	}
-
-	if (!Listener->Listen(8))
-	{
-		Sockets->DestroySocket(Listener);
-		Listener = nullptr;
 		return false;
 	}
 
 	BoundPort = Port;
 	bRunning = true;
 	Worker = MakeShared<FUEHarnessWorker>(Listener, this);
-	FRunnableThread::Create(Worker.Get(), TEXT("UEHarnessWorker"));
+	Thread = FRunnableThread::Create(Worker.Get(), TEXT("UEHarnessWorker"));
+	if (!Thread)
+	{
+		Worker.Reset();
+		Listener->Close();
+		Sockets->DestroySocket(Listener);
+		Listener = nullptr;
+		bRunning = false;
+		return false;
+	}
 	return true;
 }
 
@@ -203,11 +195,20 @@ void FUEHarnessServer::Stop()
 	if (Worker.IsValid())
 	{
 		Worker->Stop();
-		Worker.Reset();
 	}
 	if (Listener)
 	{
 		Listener->Close();
+	}
+	if (Thread)
+	{
+		Thread->WaitForCompletion();
+		delete Thread;
+		Thread = nullptr;
+	}
+	Worker.Reset();
+	if (Listener)
+	{
 		ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->DestroySocket(Listener);
 		Listener = nullptr;
 	}
@@ -243,8 +244,13 @@ FString FUEHarnessServer::HandleClientLine(const FString& Line)
 	FString Error;
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 
+	if (IsEngineExitRequested())
+	{
+		return TEXT("{\"id\":0,\"ok\":false,\"error\":\"engine shutting down\"}");
+	}
+
 	// Execute on the game thread: every editor API we touch requires it.
-	FEvent* Done = FPlatformProcess::GetSynchronicEvent();
+	FEvent* Done = FPlatformProcess::GetSynchEventFromPool();
 	AsyncTask(ENamedThreads::GameThread, [&]()
 	{
 		if (bNoTransaction)
@@ -260,7 +266,7 @@ FString FUEHarnessServer::HandleClientLine(const FString& Line)
 		Done->Trigger();
 	});
 	Done->Wait();
-	FPlatformProcess::ReturnSynchronicEvent(Done);
+	FPlatformProcess::ReturnSynchEventToPool(Done);
 
 	if (!bOk)
 	{

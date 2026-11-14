@@ -1,16 +1,15 @@
 {
 	"FileVersion": 3,
-	"Version": 2,
-	"VersionName": "1.0.1",
+	"Version": 3,
+	"VersionName": "1.0.2",
 	"FriendlyName": "Unreal Harness",
-	"Description": "Native high-speed bridge for the Unreal Harness AI agent. Gives the agent direct, transactional control of the editor: blueprint graph authoring, assets, levels, materials, logs and console.",
+	"Description": "Native high-speed bridge for the Unreal Harness AI agent. Gives the agent direct, transactional control of the editor: blueprint graph authoring, widgets, assets, levels, materials, logs and console.",
 	"Category": "Editor",
 	"CreatedBy": "Unreal Harness",
 	"CreatedByURL": "https://github.com/Arvex-GH/Unreal-Harness",
 	"DocsURL": "https://github.com/Arvex-GH/Unreal-Harness/blob/main/docs/PROTOCOL.md",
 	"MarketplaceURL": "",
 	"SupportURL": "https://github.com/Arvex-GH/Unreal-Harness/issues",
-	"EngineVersion": "5.1.0",
 	"CanContainContent": false,
 	"IsBetaVersion": false,
 	"Installed": false,
@@ -22,6 +21,10 @@
 		}
 	],
 	"Plugins": [
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		},
 		{
 			"Name": "PythonScriptPlugin",
 			"Enabled": true,

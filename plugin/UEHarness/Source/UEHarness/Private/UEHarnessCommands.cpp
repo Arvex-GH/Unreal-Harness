@@ -1,6 +1,6 @@
 // Unreal Harness - native command surface.
 //
-// Targets UE 5.1 - 5.6. Where APIs moved between versions the guarded block is
+// Targets UE 5.1 - 5.8+. Where APIs moved between versions the guarded block is
 // marked with // [VER]. Everything here runs on the game thread inside a
 // transaction, so AI edits behave exactly like human edits in the Undo stack.
 
@@ -8,6 +8,17 @@
 #include "UEHarnessModule.h"
 
 #include "Editor.h"
+#include "WidgetBlueprint.h"
+#include "Blueprint/UserWidget.h"
+#include "Blueprint/WidgetBlueprintGeneratedClass.h"
+#include "Blueprint/WidgetTree.h"
+#include "Components/CanvasPanel.h"
+#include "Components/CanvasPanelSlot.h"
+#include "Components/PanelWidget.h"
+#include "Components/TextBlock.h"
+#include "Widgets/Layout/Anchors.h"
+#include "UObject/Package.h"
+#include "Misc/PackageName.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "Engine/Level.h"
@@ -252,7 +263,11 @@ namespace
 			if (!bCapturing) { return; }
 			FScopeLock Lock(&LogLock);
 			LogRing.Add(FString::Printf(TEXT("[%s] %s"), *Category.ToString(), Msg));
+#if UE_VERSION_OLDER_THAN(5, 5, 0)
+			if (LogRing.Num() > LogRingMax) { LogRing.RemoveAt(0, LogRing.Num() - LogRingMax, false); }
+#else
 			if (LogRing.Num() > LogRingMax) { LogRing.RemoveAt(0, LogRing.Num() - LogRingMax, EAllowShrinking::No); }
+#endif
 		}
 	};
 	static FHarnessLogHook* LogHook = nullptr;
@@ -303,6 +318,7 @@ namespace UEHarness
 
 		TArray<TSharedPtr<FJsonValue>> Verbs = {
 			MakeShared<FJsonValueString>(TEXT("editor.console")),
+			MakeShared<FJsonValueString>(TEXT("editor.info")),
 			MakeShared<FJsonValueString>(TEXT("editor.log")),
 			MakeShared<FJsonValueString>(TEXT("editor.save_all")),
 			MakeShared<FJsonValueString>(TEXT("editor.undo")),
@@ -318,14 +334,17 @@ namespace UEHarness
 			MakeShared<FJsonValueString>(TEXT("bp.connect")),
 			MakeShared<FJsonValueString>(TEXT("bp.disconnect")),
 			MakeShared<FJsonValueString>(TEXT("bp.set_pin_default")),
+			MakeShared<FJsonValueString>(TEXT("bp.build_graph")),
 			MakeShared<FJsonValueString>(TEXT("bp.compile")),
 			MakeShared<FJsonValueString>(TEXT("bp.list_graphs")),
+			MakeShared<FJsonValueString>(TEXT("umg.create_widget")),
 			MakeShared<FJsonValueString>(TEXT("actor.spawn")),
 			MakeShared<FJsonValueString>(TEXT("actor.find")),
 			MakeShared<FJsonValueString>(TEXT("actor.set_property")),
 			MakeShared<FJsonValueString>(TEXT("actor.call")),
 			MakeShared<FJsonValueString>(TEXT("pie.start")),
 			MakeShared<FJsonValueString>(TEXT("pie.stop")),
+			MakeShared<FJsonValueString>(TEXT("python.exec")),
 		};
 		J->SetArrayField(TEXT("verbs"), Verbs);
 		return J;
@@ -691,12 +710,12 @@ namespace UEHarness
 				if (!GetStr(Args, TEXT("target_class"), TargetClass)) { Err = TargetClass; return false; }
 				UClass* Cls = UClass::TryFindTypeSlow<UClass>(*TargetClass);
 				if (!Cls) { Err = FString::Printf(TEXT("class not found: %s"), *TargetClass); return false; }
-				UK2Node_DynamicCast* Cast = NewObject<UK2Node_DynamicCast>(Graph);
-				Cast->TargetType = Cls;
-				Cast->NodePosX = X; Cast->NodePosY = Y;
-				Graph->AddNode(Cast, true, false);
-				Cast->AllocateDefaultPins();
-				NewNode = Cast;
+				UK2Node_DynamicCast* CastNode = NewObject<UK2Node_DynamicCast>(Graph);
+				CastNode->TargetType = Cls;
+				CastNode->NodePosX = X; CastNode->NodePosY = Y;
+				Graph->AddNode(CastNode, true, false);
+				CastNode->AllocateDefaultPins();
+				NewNode = CastNode;
 			}
 			else
 			{
@@ -805,10 +824,8 @@ namespace UEHarness
 			switch (BP->Status)
 			{
 				case BS_Unknown:                  StatusStr = TEXT("Unknown"); break;
-				case BS_DBeingCreated:            StatusStr = TEXT("BeingCreated"); break;
-				case BS_DependenciesInvalid:      StatusStr = TEXT("DependenciesInvalid"); break;
-				case BS_DuplicateName:            StatusStr = TEXT("DuplicateName"); break;
 				case BS_BeingCreated:             StatusStr = TEXT("BeingCreated"); break;
+				case BS_Dirty:                    StatusStr = TEXT("Dirty"); break;
 				case BS_UpToDate:                 StatusStr = TEXT("UpToDate"); break;
 				case BS_UpToDateWithWarnings:     StatusStr = TEXT("UpToDateWithWarnings"); break;
 				case BS_Error:                    StatusStr = TEXT("Error"); break;
@@ -890,7 +907,11 @@ namespace UEHarness
 				if (!Prop) { Err = FString::Printf(TEXT("property '%s' not found"), *PropName); return false; }
 				It->Modify();
 				void* Addr = Prop->ContainerPtrToValuePtr<void>(*It);
+#if UE_VERSION_OLDER_THAN(5, 1, 0)
 				const TCHAR* Imported = Prop->ImportText(*Value, Addr, PPF_None, It.operator->());
+#else
+				const TCHAR* Imported = Prop->ImportText_Direct(*Value, Addr, It.operator->(), PPF_None);
+#endif
 				if (!Imported)
 				{
 					Err = FString::Printf(TEXT("could not parse '%s' as %s"), *Value, *PropName);
@@ -1006,12 +1027,12 @@ namespace UEHarness
 				}
 			}
 
-			// Resolve "ref.pin" -> "guid.pin"
+			// Resolve "ref.pin" -> "guid:pin"
 			auto ResolveSpec = [&Refs](FString Spec) -> FString
 			{
 				FString Ref, Pin;
 				if (!Spec.Split(TEXT("."), &Ref, &Pin)) { return Spec; }
-				if (const FString* Guid = Refs.Find(Ref)) { return Guid->ToString() + TEXT(":") + Pin; }
+				if (const FString* Guid = Refs.Find(Ref)) { return *Guid + TEXT(":") + Pin; }
 				return Spec;
 			};
 
@@ -1085,6 +1106,105 @@ namespace UEHarness
 			Out->SetArrayField(TEXT("errors"), Errors);
 			Out->SetBoolField(TEXT("compiled"), bCompiled);
 			return Errors.Num() == 0;
+		}
+
+		// --------------------------------------------------------------- umg
+		if (Cmd == TEXT("umg.create_widget"))
+		{
+			FString Path, TitleText;
+			if (!GetStr(Args, TEXT("path"), Path)) { Err = Path; return false; }
+			Args->TryGetStringField(TEXT("title_text"), TitleText);
+
+			const FString PackageName = FPackageName::ObjectPathToPackageName(Path);
+			const FString AssetName = FPackageName::GetLongPackageAssetName(PackageName);
+			if (PackageName.IsEmpty() || AssetName.IsEmpty())
+			{
+				Err = FString::Printf(TEXT("invalid widget asset path: %s"), *Path);
+				return false;
+			}
+
+			UWidgetBlueprint* WBP = nullptr;
+			bool bCreated = false;
+			if (UEditorAssetLibrary::DoesAssetExist(PackageName))
+			{
+				WBP = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(PackageName));
+				if (!WBP)
+				{
+					Err = FString::Printf(TEXT("asset exists at %s and is not a WidgetBlueprint"), *PackageName);
+					return false;
+				}
+			}
+			else
+			{
+				UPackage* Pkg = CreatePackage(*PackageName);
+				if (!Pkg)
+				{
+					Err = FString::Printf(TEXT("failed to create package %s"), *PackageName);
+					return false;
+				}
+				WBP = Cast<UWidgetBlueprint>(FKismetEditorUtilities::CreateBlueprint(
+					UUserWidget::StaticClass(),
+					Pkg,
+					FName(*AssetName),
+					BPTYPE_Normal,
+					UWidgetBlueprint::StaticClass(),
+					UWidgetBlueprintGeneratedClass::StaticClass(),
+					NAME_None));
+				if (!WBP)
+				{
+					Err = FString::Printf(TEXT("failed to create WidgetBlueprint %s"), *PackageName);
+					return false;
+				}
+				FAssetRegistryModule::AssetCreated(WBP);
+				Pkg->MarkPackageDirty();
+				bCreated = true;
+			}
+
+			if (WBP->WidgetTree)
+			{
+				UPanelWidget* RootPanel = Cast<UPanelWidget>(WBP->WidgetTree->RootWidget);
+				if (!RootPanel)
+				{
+					UCanvasPanel* RootCanvas = WBP->WidgetTree->ConstructWidget<UCanvasPanel>(
+						UCanvasPanel::StaticClass(), TEXT("RootCanvas"));
+					WBP->WidgetTree->RootWidget = RootCanvas;
+					RootPanel = RootCanvas;
+				}
+
+				if (!TitleText.IsEmpty() && RootPanel)
+				{
+					UTextBlock* TitleWidget = WBP->WidgetTree->FindWidget<UTextBlock>(TEXT("TitleText"));
+					if (!TitleWidget)
+					{
+						TitleWidget = WBP->WidgetTree->ConstructWidget<UTextBlock>(
+							UTextBlock::StaticClass(), TEXT("TitleText"));
+						UPanelSlot* PanelSlot = RootPanel->AddChild(TitleWidget);
+						if (UCanvasPanelSlot* CanvasSlot = Cast<UCanvasPanelSlot>(PanelSlot))
+						{
+							CanvasSlot->SetAnchors(FAnchors(0.5f, 0.2f, 0.5f, 0.2f));
+							CanvasSlot->SetAlignment(FVector2D(0.5f, 0.5f));
+							CanvasSlot->SetAutoSize(true);
+						}
+					}
+					if (TitleWidget)
+					{
+						TitleWidget->SetText(FText::FromString(TitleText));
+					}
+				}
+			}
+
+			FBlueprintEditorUtils::MarkBlueprintAsModified(WBP);
+			FKismetEditorUtilities::CompileBlueprint(WBP, EBlueprintCompileOptions::SkipGarbageCollection);
+			UEditorAssetLibrary::SaveAsset(PackageName, false);
+
+			Out->SetStringField(TEXT("path"), PackageName);
+			Out->SetBoolField(TEXT("created"), bCreated);
+			Out->SetBoolField(TEXT("existed"), !bCreated);
+			if (!TitleText.IsEmpty())
+			{
+				Out->SetStringField(TEXT("title_text"), TitleText);
+			}
+			return true;
 		}
 
 		// ------------------------------------------------------------ python
